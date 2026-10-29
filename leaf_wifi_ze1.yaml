@@ -1,0 +1,1420 @@
+# ==============================================================================
+#  ESP-LEAF  —  NISSAN LEAF ZE1 CAN MONITOR
+#  ESP32-C3 Super Mini + SN65HVD230 | TX=GPIO4 | RX=GPIO3 | 500 kbps
+# ==============================================================================
+
+esp32:
+  variant: esp32c3
+  flash_size: 4MB
+  framework:
+    type: esp-idf
+
+api:
+  encryption:
+    key: !secret esp_leaf__key
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: LeafCAN
+    password: "12345678"
+
+captive_portal:
+
+logger:
+  level: INFO
+
+esphome:
+  name: esp-leaf
+  friendly_name: ESP_Leaf
+  on_loop:
+    - lambda: |-
+        const uint32_t now = millis();
+        if (id(bms_fc_pending) && id(bms_waiting_cf) && (now - id(bms_ff_ms)) > 100) {
+          id(bms_fc_pending) = false;
+          id(bms_waiting_cf) = false;
+          id(bms_flow_control).execute();
+        }
+        if (id(bms_retry_pending) && id(bms_retry_count) < 3 && (now - id(bms_last_request_ms)) > 1500) {
+          id(bms_retry_pending) = false;
+          id(bms_retry_count)++;
+          switch (id(bms_requested_group)) {
+            case 0x01: id(request_bms_group_1).execute(); break;
+            case 0x04: id(request_bms_group_4).execute(); break;
+            case 0x06: id(request_bms_group_6).execute(); break;
+            case 0x02: id(request_bms_group_2).execute(); break;
+            case 0x84: id(request_bms_group_84).execute(); break;
+            default:   id(request_bms_group_61).execute(); break;
+          }
+        }
+        if (!id(bms_ff_seen) && !id(bms_retry_pending) && id(bms_retry_count) < 3 && id(bms_last_request_ms) > 0 && (now - id(bms_last_request_ms)) > 2500) {
+          id(bms_retry_count)++;
+          switch (id(bms_requested_group)) {
+            case 0x01: id(request_bms_group_1).execute(); break;
+            case 0x04: id(request_bms_group_4).execute(); break;
+            case 0x06: id(request_bms_group_6).execute(); break;
+            case 0x02: id(request_bms_group_2).execute(); break;
+            case 0x84: id(request_bms_group_84).execute(); break;
+            default:   id(request_bms_group_61).execute(); break;
+          }
+        }
+
+
+
+# ==============================================================================
+# GLOBALS
+# ==============================================================================
+globals:
+  - id: last_59e_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: last_can_frame_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: is_charging
+    type: bool
+    initial_value: 'false'
+  - id: last_current
+    type: float
+    initial_value: '0.0'
+  - id: last_pub_current
+    type: float
+    initial_value: '0.0'
+  - id: last_voltage
+    type: float
+    initial_value: '0.0'
+  - id: last_pub_voltage
+    type: float
+    initial_value: '0.0'
+  - id: last_power
+    type: float
+    initial_value: '0.0'
+  - id: last_pub_power
+    type: float
+    initial_value: '0.0'
+  - id: last_usable_soc
+    type: float
+    initial_value: '0.0'
+  - id: last_lbc_soc
+    type: float
+    initial_value: '0.0'
+  - id: lbc_group_1_soc
+    type: float
+    initial_value: '0.0'
+  - id: last_group_1_soc
+    type: float
+    initial_value: '0.0'
+  - id: last_group_1_ahr
+    type: float
+    initial_value: '0.0'
+  - id: last_group_1_hx
+    type: float
+    initial_value: '0.0'
+  - id: full_capacity_wh
+    type: float
+    initial_value: '0.0'
+  - id: remaining_energy_wh
+    type: float
+    initial_value: '0.0'
+  - id: last_calculated_soc
+    type: float
+    initial_value: '0.0'
+  - id: last_gids
+    type: uint16_t
+    initial_value: '0'
+  - id: last_soc_gids
+    type: float
+    initial_value: '0.0'
+  - id: last_soh
+    type: uint8_t
+    initial_value: '0'
+  - id: last_gauge_segment
+    type: float
+    initial_value: '0.0'
+  - id: last_charge_time
+    type: float
+    initial_value: '0.0'
+  - id: last_obc_power
+    type: float
+    initial_value: '0.0'
+  - id: last_ambient_temp
+    type: float
+    initial_value: '0.0'
+  - id: last_ambient_ac
+    type: float
+    initial_value: '0.0'
+  - id: last_cabin_temp
+    type: float
+    initial_value: '0.0'
+  - id: last_evaporator_temp
+    type: float
+    initial_value: '0.0'
+  - id: last_inv_temp
+    type: float
+    initial_value: '0.0'
+  - id: last_igbt_temp
+    type: float
+    initial_value: '0.0'
+  - id: last_igbt_driver_temp
+    type: float
+    initial_value: '0.0'
+  - id: last_motor_temp
+    type: float
+    initial_value: '0.0'
+  - id: last_fan_speed
+    type: uint8_t
+    initial_value: '0'
+  - id: last_fan_voltage
+    type: float
+    initial_value: '0.0'
+  - id: last_ac_power
+    type: float
+    initial_value: '0.0'
+  - id: last_heater_power
+    type: float
+    initial_value: '0.0'
+  - id: bms_fc_pending
+    type: bool
+    initial_value: 'false'
+  - id: bms_waiting_cf
+    type: bool
+    initial_value: 'false'
+  - id: bms_ff_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: bms_ff_seen
+    type: bool
+    initial_value: 'false'
+  - id: bms_retry_pending
+    type: bool
+    initial_value: 'false'
+  - id: bms_retry_count
+    type: uint8_t
+    initial_value: '0'
+  - id: bms_last_request_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: bms_requested_group
+    type: uint8_t
+    initial_value: '0'
+  - id: bms_group_index
+    type: uint8_t
+    initial_value: '0'
+  - id: bms_group_4_ok
+    type: bool
+    initial_value: 'false'
+
+# ==============================================================================
+# STATUS LED (WS2812)
+# ==============================================================================
+light:
+  - platform: esp32_rmt_led_strip
+    name: "Status LED"
+    id: status_led
+    pin: GPIO8
+    num_leds: 1
+    channel_colors: GRB
+    chipset: WS2812
+
+# ==============================================================================
+# CAN BUS DECODER
+# ==============================================================================
+canbus:
+  - platform: esp32_can
+    tx_pin: GPIO4
+    rx_pin: GPIO3
+    can_id: 999
+    bit_rate: 500KBPS
+    max_frames_per_loop: 200
+    rx_queue_len: 128
+    tx_queue_len: 8
+    on_frame:
+      - can_id: 0x11A
+        use_extended_id: false
+        then:
+          - lambda: |-
+              id(last_can_frame_ms) = millis();
+              if (x.size() >= 2) {
+                const uint8_t gear = (x[0] >> 4) & 0x0F;
+                const uint8_t car_on = (x[1] >> 5) & 0x07;
+                static int last_gear_code = -1;
+                const char *gear_text = "Unknown";
+                int gear_code = 8;
+                if (gear == 0 || gear == 1) { gear_code = 0; gear_text = "Park"; }
+                else if (gear == 2) { gear_code = 2; gear_text = "Reverse"; }
+                else if (gear == 3) { gear_code = 3; gear_text = "Neutral"; }
+                else if (gear == 4) { gear_code = 4; gear_text = "Drive"; }
+                else if (gear == 7) { gear_code = 7; gear_text = "Eco/B"; }
+                if (gear_code != last_gear_code) {
+                  last_gear_code = gear_code;
+                  id(gear_shift_sensor).publish_state(gear_text);
+                }
+                static int last_caron_code = -1;
+                const char *caron_text = "Unknown";
+                int caron_code = 8;
+                if (car_on == 0) { caron_code = 0; caron_text = "OFF"; }
+                else if (car_on == 1) { caron_code = 1; caron_text = "ACC"; }
+                else if (car_on == 2 || car_on == 3) { caron_code = 2; caron_text = "ON"; }
+                else if (car_on == 4) { caron_code = 4; caron_text = "Charging/Standby"; }
+                if (caron_code != last_caron_code) {
+                  last_caron_code = caron_code;
+                  id(car_status_sensor).publish_state(caron_text);
+                }
+              }
+
+      - can_id: 0x1D4
+        use_extended_id: false
+        then:
+          - lambda: |-
+              id(last_can_frame_ms) = millis();
+              if (x.size() >= 7) {
+                const uint8_t b6 = x[6];
+                static int last_charge_status_code = -1;
+                int charge_status_code = 3;
+                const char *charge_status_text = "Disconnected/Idle";
+                if (b6 == 0xE0) {
+                  id(is_charging) = true;
+                  charge_status_code = (fabs(id(last_current)) > 0.5) ? 1 : 0;
+                  charge_status_text = (charge_status_code == 1) ? "Charging" : "Plugged/Standby";
+                } else if (b6 == 0x8C) {
+                  id(is_charging) = false;
+                  charge_status_code = 2;
+                  charge_status_text = "Interrupted";
+                } else {
+                  id(is_charging) = false;
+                  charge_status_code = 3;
+                  charge_status_text = "Disconnected/Idle";
+                }
+                if (charge_status_code != last_charge_status_code) {
+                  last_charge_status_code = charge_status_code;
+                  id(charge_status_sensor).publish_state(charge_status_text);
+                }
+                bool hv_supply = x[4] & 0x04;
+                bool relay_plus = x[5] & 0x40;
+                id(hv_supply_status_sensor).publish_state(hv_supply ? "Active" : "Inactive");
+                id(relay_plus_status_sensor).publish_state(relay_plus ? "On" : "Off");
+              }
+
+      - can_id: 0x1DB
+        use_extended_id: false
+        then:
+          - lambda: |-
+              id(last_can_frame_ms) = millis();
+              if (x.size() >= 6) {
+                int16_t raw_current = (int16_t) (((x[0] << 3) | (x[1] >> 5)) & 0x7FF);
+                if (raw_current & 0x400) raw_current |= 0xF800;
+                float current = raw_current * 0.5f;
+                if (fabs(current) < 400.0f) {
+                  if (id(last_current) == 0.0f || fabs(current - id(last_current)) < 50.0f) {
+                    id(last_current) = current;
+                    if (fabs(current - id(last_pub_current)) >= 0.6f) {
+                      id(last_pub_current) = current;
+                      id(battery_current_sensor).publish_state(current);
+                    }
+                  }
+                }
+                uint16_t raw_voltage = (uint16_t) (((x[2] << 2) | (x[3] >> 6)) & 0x3FF);
+                float voltage = raw_voltage * 0.5f;
+                if (voltage > 250.0f && voltage < 450.0f) {
+                  if (id(last_voltage) == 0.0f || fabs(voltage - id(last_voltage)) < 50.0f) {
+                    id(last_voltage) = voltage;
+                    if (fabs(voltage - id(last_pub_voltage)) >= 0.6f) {
+                      id(last_pub_voltage) = voltage;
+                      id(battery_voltage_sensor).publish_state(voltage);
+                    }
+                  }
+                }
+                float power_kw = (current * voltage) / 1000.0f;
+                if (fabs(power_kw) < 150.0f) {
+                  if (id(last_power) == 0.0f || fabs(power_kw - id(last_power)) < 50.0f) {
+                    id(last_power) = power_kw;
+                    if (fabs(power_kw - id(last_pub_power)) >= 0.25f) {
+                      id(last_pub_power) = power_kw;
+                      id(hv_power_sensor).publish_state(power_kw);
+                    }
+                  }
+                }
+                const uint8_t usable = x[4] & 0x7F;
+                if (usable > 0 && usable <= 100) {
+                  id(last_usable_soc) = usable;
+                  id(usable_soc_sensor).publish_state(usable);
+                }
+              }
+
+      - can_id: 0x1DC
+        use_extended_id: false
+        then:
+          - lambda: |-
+              id(last_can_frame_ms) = millis();
+              if (x.size() >= 4) {
+                const float d = (uint16_t) (((x[0] << 2) | (x[1] >> 6)) & 0x3FF) * 0.25f;
+                const float c = (uint16_t) ((((x[1] & 0x3F) << 4) | (x[2] >> 4)) & 0x3FF) * 0.25f;
+                if (d > 0 && d < 200) id(discharge_limit_sensor).publish_state(d);
+                if (c > 0 && c < 120) id(charge_limit_sensor).publish_state(c);
+              }
+
+      - can_id: 0x390
+        use_extended_id: false
+        then:
+          - lambda: |-
+              id(last_can_frame_ms) = millis();
+              if (x.size() >= 7) {
+                uint16_t raw_obc_power = ((x[5] << 1) | (x[6] >> 7)) & 0x1FF;
+                float obc_power_kw = raw_obc_power * 0.1f;
+
+                if (obc_power_kw > 0.1f && obc_power_kw < 10.0f) {
+                  id(last_obc_power) = obc_power_kw;
+                  id(obc_max_power_sensor).publish_state(obc_power_kw);
+                } else if (id(is_charging)) {
+                  id(obc_max_power_sensor).publish_state(id(last_obc_power));
+                } else {
+                  id(obc_max_power_sensor).publish_state(0.0f);
+                }
+              }
+
+      - can_id: 0x54A
+        use_extended_id: false
+        then:
+          - lambda: |-
+              id(last_can_frame_ms) = millis();
+              if (x.size() >= 8 && x[7] != 0xFF) {
+                const float temp_ac = x[7] - 41.0f;
+                if (temp_ac > -30.0f && temp_ac < 60.0f) id(ambient_ac_sensor).publish_state(temp_ac);
+              }
+
+      - can_id: 0x54B
+        use_extended_id: false
+        then:
+          - lambda: |-
+              id(last_can_frame_ms) = millis();
+              if (x.size() >= 5) {
+                const uint8_t fan_speed = ((x[4] >> 3) & 0x1F) & 0x07;
+                id(hvac_fan_sensor).publish_state((fan_speed / 7.0f) * 100.0f);
+                const char *hvac_text = (x[2] == 128) ? "Off" : ((x[0] == 0x00 || x[0] == 0x10) ? "On" : "Off");
+                id(hvac_status_sensor).publish_state(hvac_text);
+                const char *vent_text = "Unknown";
+                if (x[2] == 128) vent_text = "CC OFF"; else if (x[2] == 136) vent_text = "Face"; else if (x[2] == 144) vent_text = "Face/Feet"; else if (x[2] == 152) vent_text = "Feet"; else if (x[2] == 160) vent_text = "Feet/Defrost"; else if (x[2] == 168) vent_text = "Defrost";
+                id(hvac_vent_mode_sensor).publish_state(vent_text);
+                const char *intake_text = "Unknown";
+                if (x[3] == 0) intake_text = "Off"; else if (x[3] == 9) intake_text = "Recirculation"; else if (x[3] == 18) intake_text = "Fresh Air"; else if (x[3] == 146) intake_text = "Defrost";
+                id(hvac_intake_mode_sensor).publish_state(intake_text);
+              }
+
+      - can_id: 0x54C
+        use_extended_id: false
+        then:
+          - lambda: |-
+              id(last_can_frame_ms) = millis();
+              if (x.size() >= 7) {
+                if (x[6] != 0xFF) {
+                  const float temp = (x[6] * 0.5f) - 40.5f;
+                  if (temp > -30.0f && temp < 60.0f) id(ambient_temp_sensor).publish_state(temp);
+                }
+                id(evaporator_temp_sensor).publish_state(x[0] * 0.125f);
+                float fan_v = x[5] * 0.05f;
+                if (id(last_fan_speed) <= 0) fan_v = 0.0f;
+                id(fan_voltage_sensor).publish_state(fan_v);
+                if (x[1] == 0xFF) {
+                  id(climate_control_status_sensor).publish_state("Unknown");
+                  id(ac_status_sensor).publish_state("Unknown");
+                  id(hvac_defrost_sensor).publish_state("Unknown");
+                } else {
+                  id(climate_control_status_sensor).publish_state((x[1] & 0x04) ? "On" : "Off");
+                  id(ac_status_sensor).publish_state((x[1] & 0x08) ? "On" : "Off");
+                  id(hvac_defrost_sensor).publish_state((x[1] & 0x02) ? "On" : "Off");
+                }
+              }
+
+      - can_id: 0x54F
+        use_extended_id: false
+        then:
+          - lambda: |-
+              id(last_can_frame_ms) = millis();
+              if (x.size() >= 6) {
+                const float cabin_temp = (x[0] * 0.5f) - 40.0f;
+                if (cabin_temp > -20.0f && cabin_temp < 60.0f) id(cabin_temp_sensor).publish_state(cabin_temp);
+                id(ac_power_sensor).publish_state((x[1] * 50.0f) / 1000.0f);
+                id(heater_power_sensor).publish_state(((x[5] & 0x3F) * 300.0f) / 1000.0f);
+              }
+
+      - can_id: 0x55A
+        use_extended_id: false
+        then:
+          - lambda: |-
+              id(last_can_frame_ms) = millis();
+              if (x.size() >= 6) {
+                id(inverter_temp_sensor).publish_state(x[1] / 2.0f);
+                id(igbt_temp_sensor).publish_state(x[2] / 2.0f);
+                id(igbt_driver_temp_sensor).publish_state(x[3] / 2.0f);
+                const uint8_t motor_raw = (x[5] != 0) ? x[5] : x[4];
+                id(motor_temp_sensor).publish_state(motor_raw / 2.0f);
+              }
+
+      - can_id: 0x55B
+        use_extended_id: false
+        then:
+          - lambda: |-
+              id(last_can_frame_ms) = millis();
+              if (x.size() >= 2) {
+                const uint16_t raw = (uint16_t) (((x[0] << 2) | (x[1] >> 6)) & 0x3FF);
+                if (raw != 0x3FF) {
+                  const float soc = raw / 10.0f;
+                  if (soc >= 0.0f && soc <= 100.0f) id(lbc_soc_sensor).publish_state(soc);
+                }
+              }
+
+      # --------------------------------------------------------------------------
+      # 0x59E - Battery Energy and Physical Charge Estimates Calculation
+      # --------------------------------------------------------------------------
+      - can_id: 0x59E
+        use_extended_id: false
+        then:
+          - lambda: |-
+              id(last_can_frame_ms) = millis();
+              if (x.size() >= 8) {
+                id(last_59e_ms) = millis();
+                const float full_wh = (uint16_t) (((x[2] & 0x1F) << 4) | (x[3] >> 4)) * 100.0f;
+                const float remain_wh = (uint16_t) (((x[3] & 0x0F) << 5) | (x[4] >> 3)) * 100.0f;
+
+                if (full_wh > 10000.0f && full_wh < 70000.0f) {
+                  id(full_capacity_wh) = full_wh;
+                  id(full_capacity_sensor).publish_state(full_wh / 1000.0f);
+                }
+
+                if (remain_wh > 0.0f && remain_wh < 70000.0f) {
+                  id(remaining_energy_wh) = remain_wh;
+                  id(remaining_energy_sensor).publish_state(remain_wh / 1000.0f);
+                }
+
+                if (id(full_capacity_wh) > 10000.0f && id(remaining_energy_wh) > 0.0f) {
+                  float calculated_soc = (id(remaining_energy_wh) / id(full_capacity_wh)) * 100.0f;
+                  if (calculated_soc >= 0.0f && calculated_soc <= 100.0f) {
+                    id(calculated_energy_soc_sensor).publish_state(calculated_soc);
+                  }
+
+                  // --- PHYSICAL CHARGE TIME CALCULATION ---
+                  float missing_kwh = (id(full_capacity_wh) - id(remaining_energy_wh)) / 1000.0f;
+                  if (missing_kwh < 0.0f) missing_kwh = 0.0f;
+
+                  float time_3kw = (missing_kwh / 2.6f) * 60.0f;
+                  float time_6kw = (missing_kwh / 3.9f) * 60.0f;
+                  float time_qc = (missing_kwh / 23.0f) * 60.0f;
+
+                  id(charge_time_3kw_sensor).publish_state(time_3kw);
+                  id(charge_time_6kw_sensor).publish_state(time_6kw);
+                  id(charge_time_qc_sensor).publish_state(time_qc);
+                }
+              }
+
+      # --------------------------------------------------------------------------
+      # 0x5BC - GIDs and Dashboard Gauge (WITH SCALE SPIKE FILTER)
+      # --------------------------------------------------------------------------
+      - can_id: 0x5BC
+        use_extended_id: false
+        then:
+          - lambda: |-
+              if (x.size() >= 8) {
+                id(last_can_frame_ms) = millis();
+                const uint16_t raw_gids = (uint16_t) (((x[0] << 2) | (x[1] >> 6)) & 0x3FF);
+
+                // --- GIDs Scale Frame Filter ---
+                bool is_valid_gid = false;
+                if (raw_gids > 0 && raw_gids <= 800) {
+                  if (id(last_gids) > 0) {
+                    if (raw_gids == 500 && id(last_gids) < 460) {
+                      is_valid_gid = false;
+                    } else if (abs((int)raw_gids - (int)id(last_gids)) > 40 && raw_gids >= 500) {
+                      is_valid_gid = false;
+                    } else {
+                      is_valid_gid = true;
+                    }
+                  } else if (raw_gids != 500 && raw_gids != 1023) {
+                    is_valid_gid = true;
+                  }
+                }
+
+                if (is_valid_gid) {
+                  id(last_gids) = raw_gids;
+                  id(gids_sensor).publish_state(raw_gids);
+                  if (id(full_capacity_wh) > 10000.0f) {
+                    id(soc_gids_sensor).publish_state((raw_gids * 80.0f / id(full_capacity_wh)) * 100.0f);
+                  }
+                }
+
+                const uint8_t soh = (x[4] >> 1) & 0x7F;
+                id(soh_sensor).publish_state(soh);
+                id(battery_gauge_segment_sensor).publish_state(x[3] * (5.0f / 12.0f));
+              }
+
+      - can_id: 0x5C0
+        use_extended_id: false
+        then:
+          - lambda: |-
+              id(last_can_frame_ms) = millis();
+              if (x.size() >= 8) {
+                const uint8_t mux = x[0] & 0x07;
+                if (mux <= 7) {
+                  id(battery_wakeup_temp_sensor).publish_state((float) (((x[1] >> 1) & 0x7F) - 40));
+                  if (!id(bms_group_4_ok)) id(battery_temp_sensor).publish_state((float) (((x[2] >> 1) & 0x7F) - 40));
+                }
+                id(battery_heater_start_sensor).publish_state((x[0] & 0x20) ? "Requested" : "No");
+                id(battery_heater_stop_sensor).publish_state((x[0] & 0x10) ? "Requested" : "No");
+                id(battery_heater_mail_sensor).publish_state((x[1] & 0x01) ? "Requested" : "No");
+                id(battery_heater_exists_sensor).publish_state((x[4] & 0x01) ? "Yes" : "No");
+                id(battery_heater_dtc_sensor).publish_state(x[7]);
+              }
+
+      # --------------------------------------------------------------------------
+      # 0x7BB - ISO-TP BMS Protocol (Group Polling)
+      # --------------------------------------------------------------------------
+      - can_id: 0x7BB
+        use_extended_id: false
+        then:
+          - lambda: |-
+              static uint8_t bms_buffer[512] = {};
+              static uint16_t bms_expected_length = 0, bms_received_length = 0, bms_expected_sequence = 1;
+              static uint32_t bms_last_frame_ms = 0;
+              static uint8_t bms_current_group = 0;
+              if (x.size() < 8) return;
+              id(last_can_frame_ms) = millis();
+              const uint32_t now = millis();
+              if (bms_received_length > 0 && (now - bms_last_frame_ms) > 2000) {
+                bms_received_length = 0; bms_expected_length = 0; bms_current_group = 0;
+                id(bms_waiting_cf) = false; id(bms_fc_pending) = false; id(bms_retry_pending) = true;
+                return;
+              }
+              const uint8_t pci = x[0];
+              if ((pci & 0xF0) == 0x10) {
+                bms_expected_length = x[1];
+                bms_received_length = 0; bms_expected_sequence = 1; bms_current_group = x[3];
+                for (uint8_t i = 0; i < 6 && bms_received_length < bms_expected_length; i++) bms_buffer[bms_received_length++] = x[2+i];
+                bms_last_frame_ms = now; id(bms_ff_seen) = true; id(bms_ff_ms) = now; id(bms_waiting_cf) = true; id(bms_retry_pending) = false;
+                if (bms_current_group == 0x61) {
+                  const float soh = (float) (((uint16_t) x[6] << 8 | x[7]) / 100.0f);
+                  id(bms_soh_sensor).publish_state(soh);
+                }
+                if (bms_received_length < bms_expected_length) { id(bms_fc_pending) = true; return; }
+              } else if ((pci & 0xF0) == 0x20) {
+                if (bms_expected_length == 0) return;
+                if ((pci & 0x0F) != bms_expected_sequence) {
+                  bms_received_length = 0; bms_expected_length = 0; bms_current_group = 0;
+                  id(bms_waiting_cf) = false; id(bms_fc_pending) = false; id(bms_retry_pending) = true;
+                  return;
+                }
+                for (uint8_t i = 1; i < 8 && bms_received_length < bms_expected_length; i++) bms_buffer[bms_received_length++] = x[i];
+                bms_expected_sequence = (bms_expected_sequence + 1) & 0x0F;
+                bms_last_frame_ms = now; id(bms_waiting_cf) = false; id(bms_fc_pending) = false;
+                if (bms_received_length < bms_expected_length) return;
+              } else return;
+              id(bms_retry_count) = 0;
+
+              // --- GROUP 0x01: BMS Telematics ---
+              if (bms_current_group == 0x01 && bms_received_length >= 40) {
+                const float hx = (float) (((bms_buffer[30] << 8) | bms_buffer[31]) / 102.4f);
+                const float soc = (float) ((((uint32_t) bms_buffer[33] << 16) | ((uint32_t) bms_buffer[34] << 8) | bms_buffer[35]) / 10000.0f);
+                const float ahr = (float) ((((uint32_t) bms_buffer[37] << 16) | ((uint32_t) bms_buffer[38] << 8) | bms_buffer[39]) / 10000.0f);
+                id(lbc_group_1_soc_sensor).publish_state(soc);
+                id(battery_capacity_ahr_sensor).publish_state(ahr);
+                id(battery_health_sensor).publish_state(hx);
+                int32_t raw_i1 = (int32_t) (((uint32_t) bms_buffer[2] << 24) | ((uint32_t) bms_buffer[3] << 16) | ((uint32_t) bms_buffer[4] << 8) | bms_buffer[5]);
+                if (raw_i1 & 0x80000000) raw_i1 |= ~0xFFFFFFFF;
+                id(lbc_hv_current_1_sensor).publish_state((float) raw_i1 / 1024.0f);
+                int32_t raw_i2 = (int32_t) (((uint32_t) bms_buffer[8] << 24) | ((uint32_t) bms_buffer[9] << 16) | ((uint32_t) bms_buffer[10] << 8) | bms_buffer[11]);
+                if (raw_i2 & 0x80000000) raw_i2 |= ~0xFFFFFFFF;
+                id(lbc_hv_current_2_sensor).publish_state((float) raw_i2 / 1024.0f);
+                id(lbc_hv_voltage_sensor).publish_state((float) (((bms_buffer[20] << 8) | bms_buffer[21]) / 100.0));
+                id(lbc_insulation_sensor).publish_state((int) ((bms_buffer[24] << 8) | bms_buffer[25]));
+              }
+
+              // --- GROUP 0x04: NTC Temperature Sensors ---
+              if (bms_current_group == 0x04 && bms_received_length >= 13) {
+                auto raw_to_f = [](uint16_t i) -> float {
+                  if (i == 1021) return 1.0f; else if (i >= 589) return 162.0f - (i * 0.181f); else if (i >= 569) return 57.2f + ((579 - i) * 0.18f); else if (i >= 558) return 60.8f + ((558 - i) * 0.16363636f); else if (i >= 548) return 62.6f + ((548 - i) * 0.18f); else if (i >= 537) return 64.4f + ((537 - i) * 0.16363636f); else if (i >= 447) return 66.2f + ((527 - i) * 0.18f); else if (i >= 438) return 82.4f + ((438 - i) * 0.2f); else if (i >= 428) return 84.2f + ((428 - i) * 0.18f); else if (i >= 365) return 86.0f + ((419 - i) * 0.2f); else if (i >= 357) return 98.6f + ((357 - i) * 0.225f); else if (i >= 348) return 100.4f + ((348 - i) * 0.2f); else if (i >= 316) return 102.2f + ((340 - i) * 0.225f); return 109.4f + ((309 - i) * 0.25714286f);
+                };
+                uint16_t r1 = (uint16_t)((bms_buffer[2] << 8) | bms_buffer[3]);
+                uint16_t r2 = (uint16_t)((bms_buffer[5] << 8) | bms_buffer[6]);
+                uint16_t r3 = (uint16_t)((bms_buffer[8] << 8) | bms_buffer[9]);
+                uint16_t r4 = (uint16_t)((bms_buffer[11] << 8) | bms_buffer[12]);
+                float t1 = (r1 != 0xFFFF && r1 < 1022) ? ((raw_to_f(r1) - 32.0f) * 5.0f / 9.0f) : 0.0f;
+                float t2 = (r2 != 0xFFFF && r2 < 1022) ? ((raw_to_f(r2) - 32.0f) * 5.0f / 9.0f) : 0.0f;
+                float t3 = (r3 != 0xFFFF && r3 < 1022) ? ((raw_to_f(r3) - 32.0f) * 5.0f / 9.0f) : 0.0f;
+                float t4 = (r4 != 0xFFFF && r4 < 1022) ? ((raw_to_f(r4) - 32.0f) * 5.0f / 9.0f) : 0.0f;
+                id(battery_temp_sensor).publish_state((t1+t2+t3+t4)/4.0f);
+                id(battery_pack_temp1_sensor).publish_state(t1);
+                id(battery_pack_temp2_sensor).publish_state(t2);
+                id(battery_pack_temp3_sensor).publish_state(t3);
+                id(battery_pack_temp4_sensor).publish_state(t4);
+                id(bms_group_4_ok) = true;
+              }
+
+              // --- GROUP 0x02: Cell Voltages ---
+              if (bms_current_group == 0x02 && bms_received_length >= 194) {
+                int16_t cell_min = 32767, cell_max = -32768;
+                for (uint8_t k = 0; k < 96; k++) {
+                  const int16_t mv = (int16_t) ((bms_buffer[2 + 2 * k] << 8) | bms_buffer[3 + 2 * k]);
+                  if (mv < cell_min) cell_min = mv; if (mv > cell_max) cell_max = mv;
+                }
+                id(lbc_cell_min_sensor).publish_state(cell_min);
+                id(lbc_cell_max_sensor).publish_state(cell_max);
+                id(lbc_cell_delta_sensor).publish_state(cell_max - cell_min);
+                for (uint8_t part = 0; part < 4; part++) {
+                  char cells[140]; size_t pos = 0;
+                  for (uint8_t k = 0; k < 24; k++) {
+                    const int16_t mv = (int16_t) ((bms_buffer[2 + 2 * (part * 24 + k)] << 8) | bms_buffer[3 + 2 * (part * 24 + k)]);
+                    pos += snprintf(cells + pos, sizeof(cells) - pos, "%d ", mv);
+                  }
+                  cells[pos] = 0;
+                  if (part == 0) id(lbc_cells_1_sensor).publish_state(cells);
+                  else if (part == 1) id(lbc_cells_2_sensor).publish_state(cells);
+                  else if (part == 2) id(lbc_cells_3_sensor).publish_state(cells);
+                  else id(lbc_cells_4_sensor).publish_state(cells);
+                }
+              }
+
+              // --- GROUP 0x84: Battery Serial ---
+              if (bms_current_group == 0x84 && bms_received_length >= 18) {
+                char serial[24] = {0};
+                for (uint8_t i = 0; i < 18 && (2 + i) < bms_received_length; i++) {
+                  const char c = (char) bms_buffer[2 + i];
+                  if (c == 0x00 || c == (char) 0xFF || c == (char) 0xA0) break;
+                  serial[i] = c;
+                }
+                id(lbc_battery_serial_sensor).publish_state(serial);
+              }
+
+              // --- GROUP 0x06: Cell Active Balancing Shunts (FIXED NIBBLE EXTRACTION) ---
+              if (bms_current_group == 0x06 && bms_received_length >= 14) {
+                uint8_t shunt_nibbles[24];
+                for (int i = 0; i < 12; i++) {
+                  const uint8_t value = bms_buffer[i + 2];
+                  shunt_nibbles[i * 2] = value & 0x0F;
+                  shunt_nibbles[i * 2 + 1] = value >> 4;
+                }
+                const uint8_t shunt_order[4] = {8, 4, 2, 1};
+                int active_shunts = 0;
+                for (int i = 0; i < 96; i++) {
+                  if (shunt_nibbles[i / 4] & shunt_order[i % 4]) active_shunts++;
+                }
+                id(bms_group_6_active_shunts_sensor).publish_state(active_shunts);
+              }
+
+              bms_received_length = 0; bms_expected_length = 0; bms_current_group = 0;
+              id(bms_waiting_cf) = false; id(bms_fc_pending) = false;
+
+      # --------------------------------------------------------------------------
+      # PASSIVE SHUNT MONITORING (Broadcasted during charging)
+      # --------------------------------------------------------------------------
+      - can_id: 0x501
+        use_extended_id: false
+        then: &bms_shunt_logic
+          - lambda: |-
+              int active_shunts = 0;
+              for(int i=0; i<x.size(); i++) {
+                active_shunts += __builtin_popcount(x[i]);
+              }
+              static int last_shunts = -1;
+              if (active_shunts != last_shunts) {
+                last_shunts = active_shunts;
+                id(bms_active_shunts_sensor).publish_state(active_shunts);
+              }
+
+      - can_id: 0x502
+        use_extended_id: false
+        then: *bms_shunt_logic
+      - can_id: 0x503
+        use_extended_id: false
+        then: *bms_shunt_logic
+      - can_id: 0x504
+        use_extended_id: false
+        then: *bms_shunt_logic
+
+# ==============================================================================
+# SENSORS
+# ==============================================================================
+sensor:
+  # --- Battery State ---
+  - platform: template
+    name: "Usable SOC"
+    id: usable_soc_sensor
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:battery"
+
+  - platform: template
+    name: "LBC SOC"
+    id: lbc_soc_sensor
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:battery"
+
+  - platform: template
+    name: "SOC (GIDs)"
+    id: soc_gids_sensor
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:battery-sync"
+
+  - platform: template
+    name: "Calculated Energy SOC"
+    id: calculated_energy_soc_sensor
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:battery-sync"
+
+  - platform: template
+    name: "Battery SOC (LBC group 1)"
+    id: lbc_group_1_soc_sensor
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:battery"
+
+  - platform: template
+    name: "State of Health (SOH)"
+    id: soh_sensor
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: "mdi:heart-pulse"
+
+  - platform: template
+    name: "Battery SOH (LBC group 61)"
+    id: bms_soh_sensor
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:heart-pulse-outline"
+
+  - platform: template
+    name: "Battery Health (HX)"
+    id: battery_health_sensor
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:heart-pulse"
+
+  - platform: template
+    name: "Full Capacity"
+    id: full_capacity_sensor
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:battery-high"
+
+  - platform: template
+    name: "Remaining Energy"
+    id: remaining_energy_sensor
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:battery-charging"
+
+  - platform: template
+    name: "Battery Capacity (Ah)"
+    id: battery_capacity_ahr_sensor
+    unit_of_measurement: "Ah"
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:battery-charging"
+
+  - platform: template
+    name: "Battery Gauge Segment (dash)"
+    id: battery_gauge_segment_sensor
+    unit_of_measurement: "%"
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:gauge"
+
+  # --- Power & Voltage ---
+  - platform: template
+    name: "HV Battery Current"
+    id: battery_current_sensor
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:current-dc"
+
+  - platform: template
+    name: "HV Instant Power"
+    id: hv_power_sensor
+    unit_of_measurement: "kW"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:lightning-bolt"
+
+  - platform: template
+    name: "Max Discharge Power"
+    id: discharge_limit_sensor
+    unit_of_measurement: "kW"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:battery-arrow-down"
+
+  - platform: template
+    name: "Max Charge Power"
+    id: charge_limit_sensor
+    unit_of_measurement: "kW"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:battery-arrow-up"
+
+  - platform: template
+    name: "OBC Max Power"
+    id: obc_max_power_sensor
+    unit_of_measurement: "kW"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:ev-plug-type2"
+
+  - platform: template
+    name: "HV Battery Current 1 (LBC)"
+    id: lbc_hv_current_1_sensor
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:current-dc"
+
+  - platform: template
+    name: "HV Battery Current 2 (LBC)"
+    id: lbc_hv_current_2_sensor
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:current-dc"
+
+  - platform: template
+    name: "HV Battery Voltage (LBC)"
+    id: lbc_hv_voltage_sensor
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:flash"
+
+  - platform: template
+    name: "HV Battery Voltage"
+    id: battery_voltage_sensor
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:flash"
+
+  - platform: template
+    name: "Insulation Resistance"
+    id: lbc_insulation_sensor
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: "mdi:flash-alert"
+
+  # --- Pack Min/Max/Delta Voltages ---
+  - platform: template
+    name: "Cell Min Voltage"
+    id: lbc_cell_min_sensor
+    unit_of_measurement: "mV"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 0
+
+  - platform: template
+    name: "Cell Max Voltage"
+    id: lbc_cell_max_sensor
+    unit_of_measurement: "mV"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 0
+
+  - platform: template
+    name: "Cell Delta Voltage"
+    id: lbc_cell_delta_sensor
+    unit_of_measurement: "mV"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 0
+
+  # --- Temperatures ---
+  - platform: template
+    name: "Battery Temperature"
+    id: battery_temp_sensor
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:thermometer"
+
+  - platform: template
+    name: "Battery Pack Temp 1"
+    id: battery_pack_temp1_sensor
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Battery Pack Temp 2"
+    id: battery_pack_temp2_sensor
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Battery Pack Temp 3"
+    id: battery_pack_temp3_sensor
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Battery Pack Temp 4"
+    id: battery_pack_temp4_sensor
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Battery Wakeup Temperature"
+    id: battery_wakeup_temp_sensor
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:thermometer-alert"
+
+  - platform: template
+    name: "Motor Temperature"
+    id: motor_temp_sensor
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:car-coolant-level"
+
+  - platform: template
+    name: "Inverter Temperature"
+    id: inverter_temp_sensor
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:engine"
+
+  - platform: template
+    name: "IGBT Temperature"
+    id: igbt_temp_sensor
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:thermometer"
+
+  - platform: template
+    name: "IGBT Driver Temperature"
+    id: igbt_driver_temp_sensor
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:thermometer"
+
+  - platform: template
+    name: "Ambient Temperature"
+    id: ambient_temp_sensor
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:sun-thermometer"
+
+  - platform: template
+    name: "Ambient Temperature AC"
+    id: ambient_ac_sensor
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:sun-thermometer"
+
+  - platform: template
+    name: "Cabin Temperature"
+    id: cabin_temp_sensor
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:car-seat-cooler"
+
+  - platform: template
+    name: "Evaporator Temperature"
+    id: evaporator_temp_sensor
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:snowflake-thermometer"
+
+  # --- Others & Diagnostics ---
+  - platform: template
+    name: "GIDs"
+    id: gids_sensor
+    unit_of_measurement: "GIDs"
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: "mdi:car-battery"
+
+  - platform: template
+    name: "Estimated Time (Quick Charge)"
+    id: charge_time_qc_sensor
+    unit_of_measurement: "min"
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: "mdi:timer-sand"
+
+  - platform: template
+    name: "Estimated Time (6kW 100%)"
+    id: charge_time_6kw_sensor
+    unit_of_measurement: "min"
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: "mdi:timer-sand"
+
+  - platform: template
+    name: "Estimated Time (3kW 100%)"
+    id: charge_time_3kw_sensor
+    unit_of_measurement: "min"
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: "mdi:timer-sand"
+
+  - platform: template
+    name: "Battery Heater DTC"
+    id: battery_heater_dtc_sensor
+    accuracy_decimals: 0
+    icon: "mdi:alert-circle-outline"
+
+  - platform: template
+    name: "HVAC Fan Speed"
+    id: hvac_fan_sensor
+    unit_of_measurement: "%"
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: "mdi:fan"
+
+  - platform: template
+    name: "Fan Voltage"
+    id: fan_voltage_sensor
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:fan"
+
+  - platform: template
+    name: "AC Power Consumption"
+    id: ac_power_sensor
+    unit_of_measurement: "kW"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:air-conditioner"
+
+  - platform: template
+    name: "Heater Power Consumption"
+    id: heater_power_sensor
+    unit_of_measurement: "kW"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:radiator"
+
+  - platform: template
+    name: "BMS Group 6 Active Shunts"
+    id: bms_group_6_active_shunts_sensor
+    unit_of_measurement: "cells"
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: "mdi:battery-sync"
+
+  - platform: template
+    name: "BMS Active Balancing Shunts"
+    id: bms_active_shunts_sensor
+    unit_of_measurement: "cells"
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: "mdi:battery-sync"
+
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+
+# ==============================================================================
+# TEXT SENSORS
+# ==============================================================================
+text_sensor:
+  - platform: template
+    name: "Gear Shift"
+    id: gear_shift_sensor
+    icon: "mdi:car-shift-pattern"
+  - platform: template
+    name: "Car Status"
+    id: car_status_sensor
+    icon: "mdi:car-info"
+  - platform: template
+    name: "Charge Status"
+    id: charge_status_sensor
+    icon: "mdi:ev-station"
+  - platform: template
+    name: "HVAC Status"
+    id: hvac_status_sensor
+    icon: "mdi:air-conditioner"
+  - platform: template
+    name: "Climate Control Status"
+    id: climate_control_status_sensor
+    icon: "mdi:air-conditioner"
+  - platform: template
+    name: "AC Status"
+    id: ac_status_sensor
+    icon: "mdi:snowflake"
+  - platform: template
+    name: "HVAC Defrost"
+    id: hvac_defrost_sensor
+    icon: "mdi:car-defrost-front"
+  - platform: template
+    name: "HV Supply Status"
+    id: hv_supply_status_sensor
+    icon: "mdi:flash"
+  - platform: template
+    name: "Relay Plus Status"
+    id: relay_plus_status_sensor
+    icon: "mdi:electric-switch"
+  - platform: template
+    name: "Battery Heater Start"
+    id: battery_heater_start_sensor
+    icon: "mdi:radiator"
+  - platform: template
+    name: "Battery Heater Stop"
+    id: battery_heater_stop_sensor
+    icon: "mdi:radiator-off"
+  - platform: template
+    name: "Battery Heater Mail"
+    id: battery_heater_mail_sensor
+    icon: "mdi:email-alert"
+  - platform: template
+    name: "Battery Heater Exists"
+    id: battery_heater_exists_sensor
+    icon: "mdi:radiator"
+  - platform: template
+    name: "HVAC Vent Mode"
+    id: hvac_vent_mode_sensor
+    icon: "mdi:car-defrost-front"
+  - platform: template
+    name: "HVAC Intake Mode"
+    id: hvac_intake_mode_sensor
+    icon: "mdi:air-filter"
+  - platform: template
+    name: "Battery Serial"
+    id: lbc_battery_serial_sensor
+    icon: "mdi:barcode"
+  - platform: template
+    name: "Cell Voltages 1-24"
+    id: lbc_cells_1_sensor
+    icon: "mdi:battery-charging"
+  - platform: template
+    name: "Cell Voltages 25-48"
+    id: lbc_cells_2_sensor
+    icon: "mdi:battery-charging"
+  - platform: template
+    name: "Cell Voltages 49-72"
+    id: lbc_cells_3_sensor
+    icon: "mdi:battery-charging"
+  - platform: template
+    name: "Cell Voltages 73-96"
+    id: lbc_cells_4_sensor
+    icon: "mdi:battery-charging"
+
+# ==============================================================================
+# BUTTONS, INTERVALS & SCRIPTS
+# ==============================================================================
+button:
+  - platform: restart
+    name: "Restart Leaf Module"
+  - platform: template
+    name: "Wake EV-CAN Bus"
+    id: force_can_poll_button
+    icon: "mdi:radar"
+    on_press:
+      - script.execute: request_bms_group_1
+      - delay: 300ms
+      - script.execute: request_bms_group_4
+      - delay: 300ms
+      - script.execute: request_bms_group_6
+      - delay: 300ms
+      - script.execute: request_bms_group_61
+
+interval:
+  - interval: 15s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(is_charging) || id(car_status_sensor).state == "ON" || id(car_status_sensor).state == "ACC" || id(car_status_sensor).state == "Charging/Standby";
+          then:
+            - lambda: |-
+                id(bms_retry_count) = 0;
+                switch (id(bms_group_index)) {
+                  case 0: id(request_bms_group_1).execute(); break;
+                  case 1: id(request_bms_group_4).execute(); break;
+                  case 2: id(request_bms_group_6).execute(); break;
+                  case 3: id(request_bms_group_61).execute(); break;
+                  case 4: id(request_bms_group_2).execute(); break;
+                  default: id(request_bms_group_84).execute(); break;
+                }
+                id(bms_group_index) = (id(bms_group_index) + 1) % 6;
+
+  - interval: 5s
+    then:
+      - if:
+          condition:
+            light.is_on: status_led
+          then:
+            - if:
+                condition:
+                  lambda: 'return (millis() - id(last_can_frame_ms)) < 5000;'
+                then:
+                  - light.turn_on:
+                      id: status_led
+                      red: 0%
+                      green: 70%
+                      blue: 0%
+                else:
+                  - light.turn_on:
+                      id: status_led
+                      red: 70%
+                      green: 0%
+                      blue: 0%
+
+script:
+  - id: request_bms_group_2
+    mode: single
+    then:
+      - lambda: |-
+          id(bms_ff_seen) = false; id(bms_requested_group) = 0x02; id(bms_last_request_ms) = millis();
+      - canbus.send:
+          can_id: 0x79B
+          use_extended_id: false
+          data: [0x02, 0x21, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00]
+      - delay: 20ms
+      - canbus.send:
+          can_id: 0x79B
+          use_extended_id: false
+          data: [0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+
+  - id: request_bms_group_84
+    mode: single
+    then:
+      - lambda: |-
+          id(bms_ff_seen) = false; id(bms_requested_group) = 0x84; id(bms_last_request_ms) = millis();
+      - canbus.send:
+          can_id: 0x79B
+          use_extended_id: false
+          data: [0x02, 0x21, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00]
+      - delay: 20ms
+      - canbus.send:
+          can_id: 0x79B
+          use_extended_id: false
+          data: [0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+
+  - id: bms_flow_control
+    mode: single
+    then:
+      - canbus.send:
+          can_id: 0x79B
+          use_extended_id: false
+          data: [0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+
+  - id: request_bms_group_1
+    mode: single
+    then:
+      - lambda: |-
+          id(bms_ff_seen) = false; id(bms_requested_group) = 0x01; id(bms_last_request_ms) = millis();
+      - canbus.send:
+          can_id: 0x79B
+          use_extended_id: false
+          data: [0x02, 0x21, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]
+      - delay: 20ms
+      - canbus.send:
+          can_id: 0x79B
+          use_extended_id: false
+          data: [0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+
+  - id: request_bms_group_4
+    mode: single
+    then:
+      - lambda: |-
+          id(bms_ff_seen) = false; id(bms_requested_group) = 0x04; id(bms_last_request_ms) = millis();
+      - canbus.send:
+          can_id: 0x79B
+          use_extended_id: false
+          data: [0x02, 0x21, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00]
+      - delay: 20ms
+      - canbus.send:
+          can_id: 0x79B
+          use_extended_id: false
+          data: [0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+
+  - id: request_bms_group_6
+    mode: single
+    then:
+      - lambda: |-
+          id(bms_ff_seen) = false; id(bms_requested_group) = 0x06; id(bms_last_request_ms) = millis();
+      - canbus.send:
+          can_id: 0x79B
+          use_extended_id: false
+          data: [0x02, 0x21, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00]
+      - delay: 20ms
+      - canbus.send:
+          can_id: 0x79B
+          use_extended_id: false
+          data: [0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+
+  - id: request_bms_group_61
+    mode: single
+    then:
+      - lambda: |-
+          id(bms_ff_seen) = false; id(bms_requested_group) = 0x61; id(bms_last_request_ms) = millis();
+      - canbus.send:
+          can_id: 0x79B
+          use_extended_id: false
+          data: [0x02, 0x21, 0x61, 0x00, 0x00, 0x00, 0x00, 0x00]
+      - delay: 20ms
+      - canbus.send:
+          can_id: 0x79B
+          use_extended_id: false
+          data: [0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]

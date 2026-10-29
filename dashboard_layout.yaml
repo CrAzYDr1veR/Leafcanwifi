@@ -1,0 +1,193 @@
+views:
+  - title: Leaf
+    path: leaf
+    type: sections
+    max_columns: 3
+    sections:
+      - type: grid
+        cards:
+          - type: heading
+            heading: Nissan Leaf
+            heading_style: title
+            icon: mdi:car-electric
+          - type: horizontal-stack
+            cards:
+              - type: custom:mushroom-entity-card
+                entity: sensor.garagem_leaf_esp_car_status
+                name: Status
+                icon: mdi:car
+                icon_color: >-
+                  {% if
+                  is_state('sensor.garagem_leaf_esp_charge_status','Charging')
+                  %} green  {% elif
+                  is_state('sensor.garagem_leaf_esp_charge_status','Plugged/Standby')
+                  %} amber  {% else %} blue {% endif %}
+              - type: custom:mushroom-entity-card
+                entity: sensor.garagem_leaf_esp_gear_shift
+                name: Gear
+                icon: mdi:car-shift-pattern
+              - type: custom:mushroom-entity-card
+                entity: sensor.garagem_leaf_esp_charge_status
+                name: Charging
+                icon: mdi:ev-station
+          - type: horizontal-stack
+            cards:
+              - type: custom:mushroom-entity-card
+                entity: switch.smart_plug_2_tomada_1
+                name: EV Charger
+                icon: mdi:ev-plug-type2
+                icon_color: green
+                tap_action:
+                  action: toggle
+              - type: custom:mushroom-entity-card
+                entity: sensor.smart_plug_2_potencia
+                icon_color: green
+                name: Power
+              - type: custom:mushroom-entity-card
+                entity: sensor.garagem_leaf_esp_hv_supply_status
+                name: HV
+                icon: mdi:flash
+          - type: heading
+            heading: Battery
+            icon: mdi:battery
+          - type: horizontal-stack
+            cards:
+              - type: gauge
+                entity: sensor.garagem_leaf_esp_usable_soc
+                name: SOC
+                min: 0
+                max: 100
+                needle: true
+                severity:
+                  green: 50
+                  yellow: 25
+                  red: 0
+              - type: gauge
+                entity: sensor.garagem_leaf_esp_calculated_energy_soc
+                name: Energy
+                min: 0
+                max: 100
+                needle: true
+          - type: entities
+            entities:
+              - entity: sensor.garagem_leaf_esp_remaining_energy
+                name: Remaining Energy
+              - entity: sensor.garagem_leaf_esp_full_capacity
+                name: Total Capacity
+              - entity: sensor.garagem_leaf_esp_state_of_health_soh
+                name: SOH (Health)
+              - entity: sensor.garagem_leaf_esp_gids
+                name: GIDs (remaining x 80 Wh)
+              - entity: sensor.garagem_leaf_esp_soc_gids
+                name: SOC (GIDs)
+              - entity: sensor.garagem_leaf_esp_battery_soc_lbc_group_1
+                name: SOC (LBC group 1)
+              - entity: sensor.garagem_leaf_esp_battery_capacity_ah
+                name: Capacity (Ah)
+              - entity: sensor.garagem_leaf_esp_battery_health_hx
+                name: Health (HX)
+              - entity: sensor.garagem_leaf_esp_bms_group_6_active_shunts
+                name: Active Balancing Cells (Group 6)
+              - entity: sensor.garagem_leaf_esp_usable_soc_source
+                name: SOC Source
+      - type: grid
+        cards:
+          - type: heading
+            heading: Temperatures
+            icon: mdi:thermometer
+          - type: horizontal-stack
+            cards:
+              - type: custom:mushroom-entity-card
+                entity: sensor.garagem_leaf_esp_battery_gauge_segment_dash
+                name: Dashboard
+                icon_color: >-
+                  {% if
+                  states('sensor.garagem_leaf_esp_battery_gauge_segment_dash')|float
+                  > 70 %} red  {% elif
+                  states('sensor.garagem_leaf_esp_battery_gauge_segment_dash')|float
+                  > 50 %} orange  {% else %} green {% endif %}
+              - type: custom:mushroom-entity-card
+                entity: sensor.garagem_leaf_esp_motor_temperature
+                name: Motor
+                icon_color: orange
+              - type: custom:mushroom-entity-card
+                entity: sensor.garagem_leaf_esp_inverter_temperature
+                name: Inverter
+                icon_color: red
+          - type: entities
+            entities:
+              - entity: sensor.garagem_leaf_esp_battery_temperature
+                name: Battery (Average)
+              - entity: sensor.garagem_leaf_esp_battery_pack_temperatures
+                name: Pack Temperatures
+              - entity: sensor.garagem_leaf_esp_battery_temperature_source
+                name: Temperature Source
+              - entity: sensor.garagem_leaf_esp_igbt_temperature
+                name: IGBT Module
+          - type: heading
+            heading: Climate
+            icon: mdi:air-conditioner
+          - type: horizontal-stack
+            cards:
+              - type: custom:mushroom-entity-card
+                entity: sensor.garagem_leaf_esp_hvac_status
+                name: HVAC
+              - type: custom:mushroom-entity-card
+                entity: sensor.garagem_leaf_esp_cabin_temperature
+                name: Cabin
+                icon_color: cyan
+              - type: custom:mushroom-entity-card
+                entity: sensor.garagem_leaf_esp_ambient_temperature_ac
+                name: Ambient AC
+          - type: entities
+            entities:
+              - entity: sensor.garagem_leaf_esp_hvac_fan_speed
+                name: Fan Speed
+              - entity: sensor.garagem_leaf_esp_hvac_vent_mode
+                name: Vent Mode
+              - entity: sensor.garagem_leaf_esp_hvac_intake_mode
+                name: Intake Mode
+              - entity: sensor.garagem_leaf_esp_ac_power_consumption
+                name: Compressor Power
+              - entity: sensor.garagem_leaf_esp_heater_power_consumption
+                name: Heater Power
+      - type: grid
+        cards:
+          - type: heading
+            heading: Power
+            icon: mdi:lightning-bolt
+          - type: entities
+            entities:
+              - entity: sensor.garagem_leaf_esp_hv_battery_voltage
+              - entity: sensor.garagem_leaf_esp_hv_battery_current
+              - entity: sensor.garagem_leaf_esp_hv_instant_power
+              - entity: sensor.garagem_leaf_esp_max_discharge_power
+              - entity: sensor.garagem_leaf_esp_max_charge_power
+          - type: heading
+            heading: EVSE / OBC
+            icon: mdi:ev-plug-type2
+          - type: entities
+            entities:
+              - entity: sensor.garagem_leaf_esp_obc_max_power
+              - entity: sensor.garagem_leaf_esp_remaining_charge_time
+                name: Remaining Charge Time (min)
+              - entity: sensor.garagem_leaf_esp_charge_time_condition
+                name: Charge Time Condition
+          - type: heading
+            heading: System
+            icon: mdi:cog
+          - type: entities
+            entities:
+              - entity: sensor.garagem_leaf_esp_hv_supply_status
+              - entity: sensor.garagem_leaf_esp_relay_plus_status
+      - type: grid
+        cards:
+          - type: heading
+            heading: Diagnostics & 12V
+            icon: mdi:bug-check
+          - type: entities
+            entities:
+              - entity: switch.garagem_leaf_esp_debug_polling_mode
+                name: Force Polling (Debug)
+              - entity: button.garagem_leaf_esp_restart_leaf_module
+                name: Restart ESP Module

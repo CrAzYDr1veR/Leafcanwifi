@@ -1,0 +1,2444 @@
+# ==============================================================================
+#  ESP-LEAF  —  NISSAN LEAF ZE1 (2018) CAN MONITOR  —  CORRECTED RELEASE
+#  ESP32-C3 Super Mini + SN65HVD230 | TX=GPIO4 | RX=GPIO3 | 500 kbps
+#
+#  This file supersedes leafwifize1.yaml.
+#  All CAN decoders were re-checked against EV-can_ZE1.dbc (Motorla/@0 = MSB first,
+#  @1 = LSB position) and Leaf2018-CAN.pdf.
+#
+#  !! CHANGE LOG (see git history / notes) !!
+#   0x11A  gear 0 = "Park" added (DBC: 0 = Parked), 1 = "Park" kept as fallback
+#   0x1DB  Usable SOC now read from x[4] & 0x7F (LB_Usable_SOC, 1 % steps)
+#   0x1DC  charge power limit mask bug fixed: ((x[1] & 0x3F) << 4) | (x[2] >> 4)
+#   0x390  OBC max power = ((x[5] & 0x01) << 8) | x[6] * 0.1 kW, gated by
+#          OBC_Status_AC_Voltage (x[3] >> 3) & 0x03 ; publishes 0 instead of a
+#          stale value when the charger is off
+#   0x54A  ambient AC offset -41 (DBC: "Appears to track ambient (+41)")
+#   0x54B  CC status from byte 0 (00/10 = On, 01/11 = Off), vent 128 = "CC OFF",
+#          intake 146 = "Defrost", both always published (else -> Unknown)
+#   0x54C  ambient (x[6]*0.5-40.5) kept, evaporator scale 0.125 (candidate),
+#          fan voltage forced to 0 when the fan is stopped
+#   0x54F  cabin temperature from byte 0 (x[0]*0.5 - 14.0)
+#   0x55A  motor temperature from byte 5 (DBC MotorTemperature @40)
+#   0x55B  kept as LEGACY only (DBC: "used on startup by Leaf Spy Pro and then
+#          ignored") - it no longer feeds the usable SOC
+#   0x5BC  gauge segment (%, not temperature), real LB_Remain_Charge_Time and
+#          LB_Remain_Charge_Time_Condition added (the 3 invented charge times
+#          were removed)
+#   0x5C0  mux filter widened (<= 6) + verbose log
+#   0x7BB  ISO-TP reassembly fixed (512 B bms_buffer, group id validated, flow
+#          control sent on First Frame, publish only on change)
+#   REMOVED  0x501..0x504 handlers + "BMS Active Balancing Shunts" sensor
+#            (those IDs do not exist on the ZE1)
+#   REMOVED  0x56E flood (10 frames / 15 s) and the debug polling default
+#
+#  REVISION 2 (after the first runtime test on the car)
+#   0x1DB  usable SOC: the DBC position (x[4] & 0x7F) returns 0 on the ZE1,
+#          so the legacy LBC SOC (0x55B) is used as fallback + raw byte log
+#   0x54B  fan speed: only the low 3 bits are the speed (the 2 upper bits of
+#          the 5 bit field are other flags on this car)
+#   0x54F  cabin temperature: offset -40 (the DBC "-14" gives 45 C, absurd;
+#          every other temperature in this DBC uses -40)
+#   0x55A  motor temperature: byte 5 is always 0 on this car -> byte 4
+#   0x5BC  remaining charge time only published when plausible (1..720 min),
+#          raw bytes + candidate decodings are logged
+#   0x5C0  mux filter widened to 0..7 (DBC range is 0..6)
+#   0x7BB  ISO-TP flow control is NO LONGER sent from the RX callback (it is
+#          sent from the main loop) and is also sent right after the request,
+#          exactly as documented in Leaf2018-CAN.pdf -> group 6 now answers
+#   BUS    max_frames_per_loop 50 -> 200 and logger back to INFO: with DEBUG
+#          the ESP32-C3 saturated its main loop and the CAN driver was
+#          dropping frames ("Reached max_frames_per_loop=50")
+#   LED    last_can_frame_ms is now updated by every handler (not only 0x5BC)
+#
+#  REVISION 3 (after the second runtime test on the car)
+#   BUS    ROOT CAUSE of the lost multi frame answers (0x7BB): the ESP-IDF
+#          TWAI driver uses rx_queue_len = 0 by default, so only ONE frame
+#          could be pending between the ISR and the ESPHome loop.  The LBC
+#          answers a request with a burst of 4..8 frames back to back, so all
+#          but one frame were dropped by the driver ("out of sequence frame 2
+#          (expected 1)" = a DROPPED CF#1, not a wrong numbering).
+#          -> rx_queue_len: 64, tx_queue_len: 8
+#   0x7BB  the flow control is now only sent when the LBC really waits for it
+#          (no consecutive frame 100 ms after the first frame): a second flow
+#          control in the middle of the burst resets the numbering of the
+#          frames.  An incomplete answer is now repeated (max 3 times).
+#   0x7BB  new groups are polled (rotation, one request every 15 s):
+#          group 1 = SOC / AHR / HX, group 4 = the four pack temperatures,
+#          group 6 = shunts, group 61 = SOH
+#   0x1DB  publish thresholds (0.6 A / 0.6 V / 0.25 kW): the frame arrives
+#          several times per second and the values oscillate between two
+#          adjacent steps, which created ~110 000 rows per day in the DB
+#   0x1DC  published only on change + raw log (with MAX_POWER_FOR_CHARGER)
+#   0x54B  the HVAC is only reported as "On" when the vent mode target does
+#          not contradict it (x[2] = 128 = "CC OFF" while the car was off)
+#   0x54C  x[1] = 0xFF is a padding byte -> CC / AC / defrost = "Unknown"
+#          (they were three false "On" while the car was off)
+#   0x59E  the time of the last capacity frame is kept (the 0x5BC cross check
+#          is only used while the data is fresh)
+#   0x5BC  VARIANT GATE: the frame arrives in two variants (214 GIDs = valid /
+#          500 GIDs = impossible).  The GIDs are now cross checked against the
+#          remaining energy (0x59E) and against the capacity of the pack, and
+#          the charge time is only published in the physical range
+#   0x5BC  the charge time condition table was shifted by one (DBC 1468:
+#          0/5/8/11/18/21/24) -> corrected
+#   NEW    "SOC (GIDs)", "Battery SOC (LBC group 1)", "Battery Capacity (Ah)",
+#          "Battery Health (HX)", "Battery Temperature Source" and
+#          "Battery Pack Temperatures" (the real pack temperatures come from
+#          the LBC group 4, the 0x5C0 byte is 0xFF on this car)
+#
+#  NOTES (checked against EV-can_ZE1.dbc + Leaf2018-CAN.pdf)
+#   GIDs    the 0x5BC GID value is CORRECT and it is the REMAINING capacity:
+#           "Nissan multiplies this value by 80 Wh to get current capacity of
+#            the HV Battery" and "0-498 for 40kWh" (full pack = 498 GIDs).
+#           199 GIDs x 80 Wh = 15.9 kWh = the energy left in the battery, so it
+#           goes UP while the car charges.  It is not a bug.
+#   0x1DB   LB_Usable_SOC is documented in the DBC at x[4] & 0x7F but that
+#           byte is always 0 on this car -> the raw bytes are logged once per
+#           second to locate the real position, and the legacy LBC SOC (0x55B)
+#           is used as fallback so the dashboard keeps a sane value.
+# ==============================================================================
+
+esphome:
+  name: esp-leaf
+  friendly_name: ESP_Leaf
+  # The ISO-TP flow control must NOT be sent from the CAN receive callback
+  # (it can block the RX task), so the 0x7BB handler only raises a flag and
+  # the frame is sent from here, in the main loop.
+  #
+  # REVISION 3:
+  #  * the flow control is only sent when the LBC is really waiting for it
+  #    (no Consecutive Frame received 100 ms after the First Frame).  A
+  #    second flow control in the middle of the burst resets the numbering
+  #    of the frames of the answer.
+  #  * a request whose answer was not completed is repeated (max 3 times).
+  on_loop:
+    - lambda: |-
+        const uint32_t now = millis();
+
+        // ---- ISO-TP flow control (fallback) ---------------------------
+        if (id(bms_fc_pending) && id(bms_waiting_cf) && (now - id(bms_ff_ms)) > 100) {
+          id(bms_fc_pending) = false;
+          id(bms_waiting_cf) = false;
+          id(bms_flow_control).execute();
+        }
+
+        // ---- repeat a request whose answer was incomplete -------------
+        if (id(bms_retry_pending) && id(bms_retry_count) < 3 &&
+            (now - id(bms_last_request_ms)) > 1500) {
+          id(bms_retry_pending) = false;
+          id(bms_retry_count)++;
+          ESP_LOGW("leaf_7BB", "answer incomplete - repeating the request (try %d)", id(bms_retry_count));
+          switch (id(bms_requested_group)) {
+            case 0x01: id(request_bms_group_1).execute(); break;
+            case 0x04: id(request_bms_group_4).execute(); break;
+            case 0x06: id(request_bms_group_6).execute(); break;
+            default:   id(request_bms_group_61).execute(); break;
+          }
+        }
+
+        // ---- no answer at all -> repeat the request -------------------
+        // The timeout of the 0x7BB handler can only be detected when a frame
+        // arrives, so a request that is not answered at all is repeated here.
+        if (!id(bms_ff_seen) && !id(bms_retry_pending) && id(bms_retry_count) < 3 &&
+            id(bms_last_request_ms) > 0 && (now - id(bms_last_request_ms)) > 2500) {
+          id(bms_retry_count)++;
+          ESP_LOGW("leaf_7BB", "no answer - repeating the request (try %d)", id(bms_retry_count));
+          switch (id(bms_requested_group)) {
+            case 0x01: id(request_bms_group_1).execute(); break;
+            case 0x04: id(request_bms_group_4).execute(); break;
+            case 0x06: id(request_bms_group_6).execute(); break;
+            default:   id(request_bms_group_61).execute(); break;
+          }
+        }
+
+esp32:
+  variant: esp32c3
+  flash_size: 4MB
+  framework:
+    type: esp-idf
+
+api:
+  encryption:
+    key: "YOUR_ENCRYPTION_KEY_HERE"
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: LeafCAN
+    password: "12345678"
+
+captive_portal:
+
+# ==============================================================================
+# LOGGER  (INFO: the raw CAN frames that still need to be validated are logged
+#          by our own throttled ESP_LOGI, one line per second, see below)
+# ==============================================================================
+logger:
+  # The global level must be at least as verbose as the per component levels,
+  # otherwise ESPHome refuses to compile:
+  #   "The configured log level for canbus (DEBUG) must not be less severe
+  #    than the global log level (INFO)."
+  # INFO (not DEBUG): with DEBUG the ESP32-C3 saturated its main loop and the
+  # CAN driver started to drop frames ("Reached max_frames_per_loop=50,
+  # deferring remaining CAN frames").  The few frames that still need to be
+  # watched are logged by our own throttled ESP_LOGI (1 line per second).
+  level: INFO
+  logs:
+    canbus: INFO
+    esp32_can: INFO
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: "Europe/London"
+
+# ==============================================================================
+# WEB SERVER (Modern UI)
+# ==============================================================================
+web_server:
+  port: 80
+  version: 3
+  local: true
+  include_internal: false
+
+# ------------------------------------------------------------------------------
+# GLOBALS
+# ------------------------------------------------------------------------------
+globals:
+  - id: is_charging
+    type: bool
+    initial_value: "false"
+
+  - id: last_voltage
+    type: float
+    initial_value: "0.0"
+
+  - id: last_current
+    type: float
+    initial_value: "0.0"
+
+  - id: last_power
+    type: float
+    initial_value: "0.0"
+
+  - id: last_discharge_limit
+    type: float
+    initial_value: "0.0"
+
+  - id: last_charge_limit
+    type: float
+    initial_value: "0.0"
+
+  - id: last_obc_power
+    type: float
+    initial_value: "0.0"
+
+  - id: last_charge_time
+    type: float
+    initial_value: "0.0"
+
+  - id: last_inv_temp
+    type: float
+    initial_value: "0.0"
+
+  - id: full_capacity_wh
+    type: float
+    initial_value: "0.0"
+
+  - id: remaining_energy_wh
+    type: float
+    initial_value: "0.0"
+
+  # --- new ---
+  - id: last_fan_speed
+    type: int
+    initial_value: "0"
+
+  - id: last_usable_soc
+    type: float
+    initial_value: "0.0"
+
+  - id: last_gauge_segment
+    type: float
+    initial_value: "0.0"
+
+  - id: last_charge_time_condition
+    type: int
+    initial_value: "-1"
+
+  - id: last_bms_soh
+    type: float
+    initial_value: "0.0"
+
+  - id: bms_last_shunt_count
+    type: int
+    initial_value: "-1"
+
+  # set by the request script, cleared when the First Frame arrives
+  - id: bms_ff_seen
+    type: bool
+    initial_value: "false"
+
+  # raised by the 0x7BB handler when a First Frame arrives; the ISO-TP flow
+  # control is then sent from the main loop (never from the RX callback)
+  - id: bms_fc_pending
+    type: bool
+    initial_value: "false"
+
+  # SOC coming from the legacy LBC frame 0x55B (0.1 % resolution).
+  # Used as a fallback while the dash SOC (0x1DB) is not available.
+  - id: last_lbc_soc
+    type: float
+    initial_value: "0.0"
+
+  # dash SOC (0x1DB). 0 = not available on this car.
+  - id: last_dash_soc
+    type: float
+    initial_value: "0.0"
+
+  # last raw fan speed field (0x54B) - only used to log on change
+  - id: last_fan_raw
+    type: int
+    initial_value: "-1"
+
+  # last GIDs (0x5BC) and last SOH (0x5BC) - publish on change only
+  - id: last_gids
+    type: int
+    initial_value: "-1"
+
+  - id: last_soh
+    type: int
+    initial_value: "-1"
+
+  # SOC calculated from the GIDs (GIDs x 80 Wh / full capacity)
+  - id: last_soc_gids
+    type: float
+    initial_value: "-1.0"
+
+  # last SOC published from the remaining energy (0x59E)
+  - id: last_calculated_soc
+    type: float
+    initial_value: "-1.0"
+
+  # REVISION 3: last published values of the "slow" sensors (HVAC, thermal).
+  # They are used to publish only when the value really changes, so that the
+  # Home Assistant database does not get a new row for every CAN frame.
+  - id: last_ambient_ac
+    type: float
+    initial_value: "-999.0"
+
+  - id: last_ambient_temp
+    type: float
+    initial_value: "-999.0"
+
+  - id: last_evaporator_temp
+    type: float
+    initial_value: "-999.0"
+
+  - id: last_fan_voltage
+    type: float
+    initial_value: "-999.0"
+
+  - id: last_cabin_temp
+    type: float
+    initial_value: "-999.0"
+
+  - id: last_ac_power
+    type: float
+    initial_value: "-999.0"
+
+  - id: last_heater_power
+    type: float
+    initial_value: "-999.0"
+
+  - id: last_igbt_temp
+    type: float
+    initial_value: "-999.0"
+
+  - id: last_igbt_driver_temp
+    type: float
+    initial_value: "-999.0"
+
+  - id: last_motor_temp
+    type: float
+    initial_value: "-999.0"
+
+  # last raw charge status byte (0x1D4) - only used to log on change
+  - id: last_charge_status_raw
+    type: int
+    initial_value: "-1"
+
+  # timestamp of the last CAN frame received (status LED)
+  - id: last_can_frame_ms
+    type: uint32_t
+    initial_value: "0"
+
+  # --- REVISION 3 ---------------------------------------------------------
+  # timestamp of the last 0x59E (capacity) frame: the 0x5BC cross check is
+  # only used while this data is fresh
+  - id: last_59e_ms
+    type: uint32_t
+    initial_value: "0"
+
+  # ISO-TP state of the 0x7BB answer
+  - id: bms_ff_ms
+    type: uint32_t
+    initial_value: "0"
+
+  # true between the First Frame and the first Consecutive Frame
+  - id: bms_waiting_cf
+    type: bool
+    initial_value: "false"
+
+  # the group that was requested last (used to repeat a failed request)
+  - id: bms_requested_group
+    type: int
+    initial_value: "6"
+
+  - id: bms_last_request_ms
+    type: uint32_t
+    initial_value: "0"
+
+  # a request is repeated (max 3 times) when the answer is incomplete
+  - id: bms_retry_pending
+    type: bool
+    initial_value: "false"
+
+  - id: bms_retry_count
+    type: int
+    initial_value: "0"
+
+  # rotation of the LBC groups that are polled (1 = SOC, 4 = temperatures,
+  # 6 = shunts, 61 = SOH)
+  - id: bms_group_index
+    type: int
+    initial_value: "0"
+
+  # values decoded from the LBC group 1 answer
+  - id: lbc_group_1_soc
+    type: float
+    initial_value: "0.0"
+
+  # last published values of the LBC group 1 answer (on change only)
+  - id: last_group_1_soc
+    type: float
+    initial_value: "-1.0"
+
+  - id: last_group_1_ahr
+    type: float
+    initial_value: "-1.0"
+
+  - id: last_group_1_hx
+    type: float
+    initial_value: "-1.0"
+
+  # last published average of the LBC group 4 pack temperatures
+  - id: last_pack_temp_avg
+    type: float
+    initial_value: "-999.0"
+
+  # true when the LBC group 4 answer (the real pack temperatures) was
+  # received at least once
+  - id: bms_group_4_ok
+    type: bool
+    initial_value: "false"
+
+  - id: lbc_group_1_ahr
+    type: float
+    initial_value: "0.0"
+
+  - id: lbc_group_1_hx
+    type: float
+    initial_value: "0.0"
+
+  # last PUBLISHED values of the 0x1DB (the 0x1DB arrives several times per
+  # second and the values oscillate between two adjacent steps: publishing
+  # every frame created ~110 000 rows per day in the HA database)
+  - id: last_pub_current
+    type: float
+    initial_value: "-999.0"
+
+  - id: last_pub_voltage
+    type: float
+    initial_value: "-999.0"
+
+  - id: last_pub_power
+    type: float
+    initial_value: "-999.0"
+
+# ------------------------------------------------------------------------------
+# ONBOARD RGB LED
+# ------------------------------------------------------------------------------
+light:
+  - platform: esp32_rmt_led_strip
+    name: "Status LED"
+    id: status_led
+    pin: GPIO8
+    num_leds: 1
+    # ESPHome 2026.10: "rgb_order" is deprecated -> "channel_colors"
+    channel_colors: GRB
+    chipset: WS2812
+
+# ==============================================================================
+# CAN BUS
+# ==============================================================================
+canbus:
+  - platform: esp32_can
+    tx_pin: GPIO4
+    rx_pin: GPIO3
+    can_id: 999
+    bit_rate: 500KBPS
+    # The ZE1 bus is busy (0x1C2, 0x1F2, 0x120, 0x1D4, 0x1DA, 0x1DB, 0x355,
+    # 0x5C5, 0x11A, 0x390, 0x393, 0x56E, 0x4B9, 0x50A, 0x1DC, 0x55A, 0x625...).
+    # With the default 50 the ESPHome warned "Reached max_frames_per_loop=50,
+    # deferring remaining CAN frames" and frames were really lost.
+    max_frames_per_loop: 200
+    # REVISION 3 - ROOT CAUSE of the lost multi frame answers (0x7BB):
+    # the ESP-IDF TWAI driver uses rx_queue_len = 0 by default, which means
+    # that only ONE frame can be pending between the ISR and the ESPHome
+    # loop.  The LBC answers the 0x79B request with a burst of 4..8 frames
+    # back to back, so every frame but one was dropped by the driver (the
+    # "out of sequence frame 2 (expected 1)" error was a DROPPED CF#1, not
+    # a wrong numbering).  64 slots make sure that no frame of a burst is
+    # ever lost.  The same applies to the TX queue (2 frames per request).
+    rx_queue_len: 64
+    tx_queue_len: 8
+
+    on_frame:
+
+      # --------------------------------------------------------------------------
+      # 0x11A - VCM : gear position + car on/off status
+      #   DBC 282 : SG_ JoystickGearPosition 4|4@1+  -> (x[0] >> 4) & 0x0F
+      #   VAL_ 282 : 0 = "Parked", 2 = "Reverse", 3 = "Neutral", 4 = "Drive/B"
+      # --------------------------------------------------------------------------
+      - can_id: 0x11A
+        use_extended_id: false
+        then:
+          - lambda: |-
+              id(last_can_frame_ms) = millis();
+              if (x.size() >= 2) {
+                const uint8_t gear = (x[0] >> 4) & 0x0F;
+                const uint8_t car_on = (x[1] >> 5) & 0x07;
+
+                static uint32_t log_ms = 0;
+                const uint32_t now_ms = millis();
+                if (now_ms - log_ms > 5000) {
+                  log_ms = now_ms;
+                  ESP_LOGI("leaf_11A", "gear=%u caron=%u  raw=[%02X %02X]",
+                           (unsigned) gear, (unsigned) car_on, (unsigned) x[0], (unsigned) x[1]);
+                }
+
+                // REVISION 3: the text sensors are published only when they
+                // change (these frames arrive several times per second).
+                static int last_gear_code = -1;
+                const char *gear_text = "Unknown";
+                int gear_code = 8;
+                if (gear == 0)       { gear_code = 0; gear_text = "Park"; }
+                else if (gear == 1)  { gear_code = 0; gear_text = "Park"; }   // fallback
+                else if (gear == 2)  { gear_code = 2; gear_text = "Reverse"; }
+                else if (gear == 3)  { gear_code = 3; gear_text = "Neutral"; }
+                else if (gear == 4)  { gear_code = 4; gear_text = "Drive"; }
+                else if (gear == 7)  { gear_code = 7; gear_text = "Eco/B"; }
+                if (gear_code != last_gear_code) {
+                  last_gear_code = gear_code;
+                  id(gear_shift_sensor).publish_state(gear_text);
+                }
+
+                static int last_caron_code = -1;
+                const char *caron_text = "Unknown";
+                int caron_code = 8;
+                if (car_on == 0) { caron_code = 0; caron_text = "OFF"; }
+                else if (car_on == 1) { caron_code = 1; caron_text = "ACC"; }
+                else if (car_on == 2 || car_on == 3) { caron_code = 2; caron_text = "ON"; }
+                else if (car_on == 4) { caron_code = 4; caron_text = "Charging/Standby"; }
+                if (caron_code != last_caron_code) {
+                  last_caron_code = caron_code;
+                  id(car_status_sensor).publish_state(caron_text);
+                }
+              }
+
+      # --------------------------------------------------------------------------
+      # 0x1D4 - VCM : charge status / HV supply / relay plus
+      #   DBC 468 : ChargeStatus 48|8@1+ -> x[6]
+      #             StatusOfHighVoltagePowerSupply 34|1@1+ -> x[4] bit 2
+      #             Relay_Plus_Output_Status 46|1@1+ -> x[5] bit 6
+      # --------------------------------------------------------------------------
+      - can_id: 0x1D4
+        use_extended_id: false
+        then:
+          - lambda: |-
+              id(last_can_frame_ms) = millis();
+              if (x.size() >= 7) {
+                const uint8_t b6 = x[6];
+
+                if (b6 != id(last_charge_status_raw)) {
+                  id(last_charge_status_raw) = b6;
+                  ESP_LOGI("leaf_1D4", "chargestatus=0x%02X  raw=[%02X %02X %02X %02X %02X %02X %02X]",
+                           (unsigned) b6, (unsigned) x[0], (unsigned) x[1], (unsigned) x[2], (unsigned) x[3], (unsigned) x[4], (unsigned) x[5], (unsigned) x[6]);
+                }
+
+                // published only when they change
+                static int last_charge_status_code = -1;
+                int charge_status_code = 3;
+                const char *charge_status_text = "Disconnected/Idle";
+                if (b6 == 0xE0) {
+                  id(is_charging) = true;
+                  if (fabs(id(last_current)) > 0.5) {
+                    charge_status_code = 1;
+                    charge_status_text = "Charging";
+                  } else {
+                    charge_status_code = 0;
+                    charge_status_text = "Plugged/Standby";
+                  }
+                } else if (b6 == 0x8C) {
+                  id(is_charging) = false;
+                  charge_status_code = 2;
+                  charge_status_text = "Interrupted";
+                } else {
+                  id(is_charging) = false;
+                  charge_status_code = 3;
+                  charge_status_text = "Disconnected/Idle";
+                }
+                if (charge_status_code != last_charge_status_code) {
+                  last_charge_status_code = charge_status_code;
+                  id(charge_status_sensor).publish_state(charge_status_text);
+                }
+
+                bool hv_supply = x[4] & 0x04;
+                bool relay_plus = x[5] & 0x40;
+
+                static int last_hv_code = -1;
+                if ((int) hv_supply != last_hv_code) {
+                  last_hv_code = (int) hv_supply;
+                  id(hv_supply_status_sensor).publish_state(hv_supply ? "Active" : "Inactive");
+                }
+                static int last_relay_code = -1;
+                if ((int) relay_plus != last_relay_code) {
+                  last_relay_code = (int) relay_plus;
+                  id(relay_plus_status_sensor).publish_state(relay_plus ? "On" : "Off");
+                }
+              }
+
+      # --------------------------------------------------------------------------
+      # 0x1DB - LBC : current / voltage / power / USABLE SOC
+      #   DBC 475 : LB_Current       7|11@0-  -> ((x[0] << 3) | (x[1] >> 5)) * 0.5 A
+      #             LB_Total_Voltage 23|10@0+  -> ((x[2] << 2) | (x[3] >> 6)) * 0.5 V
+      #             LB_Usable_SOC    32|7@1+   -> x[4] & 0x7F   (1 % steps)
+      #   LB_Usable_SOC = "1% resolution 'proper' SOC calculated by the LBC and
+      #   used by ABB chargers and the SOC display in the dash menu"
+      # --------------------------------------------------------------------------
+      - can_id: 0x1DB
+        use_extended_id: false
+        then:
+          - lambda: |-
+              id(last_can_frame_ms) = millis();
+              if (x.size() >= 6) {
+
+                // raw bytes, logged once per second (needed to locate the
+                // dash SOC on this car - the DBC position gives 0)
+                static uint32_t log_ms = 0;
+                const uint32_t now_ms = millis();
+                if (now_ms - log_ms > 1000) {
+                  log_ms = now_ms;
+                  ESP_LOGI("leaf_1DB", "raw=[%02X %02X %02X %02X %02X %02X]  dash_soc(x4&7F)=%u  bytes=%u/%u/%u",
+                           (unsigned) x[0], (unsigned) x[1], (unsigned) x[2], (unsigned) x[3], (unsigned) x[4], (unsigned) x[5],
+                           (unsigned) (x[4] & 0x7F), (unsigned) x[2], (unsigned) x[3], (unsigned) x[4]);
+                }
+
+                // CURRENT  (signed, 0.5 A/bit)
+                int16_t raw_current = (int16_t) (((x[0] << 3) | (x[1] >> 5)) & 0x7FF);
+                if (raw_current & 0x400) raw_current |= 0xF800;
+                float current = raw_current * 0.5f;
+
+                // REVISION 3: the value is only published when it really
+                // changed.  The resolution of the frame is 0.5 A and the
+                // value oscillates between two adjacent steps (4.0 / 4.5 A),
+                // which created ~110 000 rows per day in the HA database.
+                if (fabs(current) < 400.0f) {
+                  if (fabs(current - id(last_current)) < 50.0f) {
+                    id(last_current) = current;
+                    if (fabs(current - id(last_pub_current)) >= 0.6f) {
+                      id(last_pub_current) = current;
+                      id(battery_current_sensor).publish_state(current);
+                    }
+                  }
+                }
+
+                // VOLTAGE
+                uint16_t raw_voltage = (uint16_t) (((x[2] << 2) | (x[3] >> 6)) & 0x3FF);
+                float voltage = raw_voltage * 0.5f;
+
+                if (voltage > 250.0f && voltage < 450.0f) {
+                  if (fabs(voltage - id(last_voltage)) < 50.0f) {
+                    id(last_voltage) = voltage;
+                    if (fabs(voltage - id(last_pub_voltage)) >= 0.6f) {
+                      id(last_pub_voltage) = voltage;
+                      id(battery_voltage_sensor).publish_state(voltage);
+                    }
+                  }
+                }
+
+                // POWER
+                float power_kw = (current * voltage) / 1000.0f;
+
+                if (fabs(power_kw) < 150.0f) {
+                  if (fabs(power_kw - id(last_power)) < 50.0f) {
+                    id(last_power) = power_kw;
+                    if (fabs(power_kw - id(last_pub_power)) >= 0.25f) {
+                      id(last_pub_power) = power_kw;
+                      id(hv_power_sensor).publish_state(power_kw);
+                    }
+                  }
+                }
+
+                // --- USABLE SOC (dash SOC) ----------------------------------
+                // DBC 475 : LB_Usable_SOC 32|7@1+ -> x[4] & 0x7F
+                // On this car (ZE1 40 kWh) that byte is always 0, so the value
+                // is taken from the LBC group 1 answer (authoritative SOC) and
+                // from the legacy LBC frame 0x55B as last fallback.
+                // REVISION 3: the priority is now
+                //   dash 0x1DB  >  LBC group 1  >  legacy LBC 0x55B
+                const uint8_t usable = x[4] & 0x7F;
+
+                // The source of the SOC is published only when it changes
+                // (this frame arrives several times per second).
+                static int last_soc_source_code = -1;
+                int soc_source_code = 0;
+                if (usable > 0 && usable <= 100)          soc_source_code = 1;
+                else if (id(lbc_group_1_soc) > 0.0f)      soc_source_code = 2;
+                else if (id(last_lbc_soc) > 0.0f)         soc_source_code = 3;
+                if (soc_source_code != last_soc_source_code) {
+                  last_soc_source_code = soc_source_code;
+                  if (soc_source_code == 1)      id(usable_soc_source_sensor).publish_state("Dash 0x1DB");
+                  else if (soc_source_code == 2) id(usable_soc_source_sensor).publish_state("LBC group 1");
+                  else if (soc_source_code == 3) id(usable_soc_source_sensor).publish_state("LBC 0x55B (fallback)");
+                }
+
+                if (usable > 0 && usable <= 100) {
+                  id(last_dash_soc) = usable;
+                  if (fabs(usable - id(last_usable_soc)) > 0.01f) {
+                    id(last_usable_soc) = usable;
+                    id(usable_soc_sensor).publish_state(usable);
+                    ESP_LOGI("leaf_1DB", "dash SOC (0x1DB) = %u %%", (unsigned) usable);
+                  }
+                } else if (id(lbc_group_1_soc) > 0.0f) {
+                  // LBC group 1: the real SOC of the HV battery (0.01 %)
+                  if (fabs(id(lbc_group_1_soc) - id(last_usable_soc)) >= 0.05f) {
+                    id(last_usable_soc) = id(lbc_group_1_soc);
+                    id(usable_soc_sensor).publish_state(id(last_usable_soc));
+                    ESP_LOGI("leaf_1DB", "dash SOC unavailable -> LBC group 1 SOC = %.2f %%", id(lbc_group_1_soc));
+                  }
+                } else if (id(last_lbc_soc) > 0.0f) {
+                  // fallback: legacy LBC SOC (0x55B), published with 1 % steps
+                  if (fabs(id(last_lbc_soc) - id(last_usable_soc)) >= 0.9f) {
+                    id(last_usable_soc) = id(last_lbc_soc);
+                    id(usable_soc_sensor).publish_state(id(last_usable_soc));
+                    ESP_LOGI("leaf_1DB", "dash SOC unavailable -> legacy LBC SOC (0x55B) = %.1f %%", id(last_lbc_soc));
+                  }
+                }
+              }
+
+      # --------------------------------------------------------------------------
+      # 0x1DC - LBC : charge / discharge power limits
+      #   DBC 476 : LB_Discharge_Power_Limit 7|10@0+  -> ((x[0] << 2) | (x[1] >> 6)) * 0.25 kW
+      #             LB_Charge_Power_Limit    13|10@0+ -> ((x[1] & 0x3F) << 4) | (x[2] >> 4)) * 0.25 kW
+      #             LB_MAX_POWER_FOR_CHARGER 19|10@0+ -> ((x[2] & 0x0F) << 6) | (x[3] >> 2)) * 0.1 - 10 kW
+      #   REVISION 3: published only when the value changes (these are limits,
+      #   they do not oscillate) and the raw bytes are logged so the scale can
+      #   be confirmed (125 kW discharge / 60 kW charge vs 1.9 kW of the OBC).
+      # --------------------------------------------------------------------------
+      - can_id: 0x1DC
+        use_extended_id: false
+        then:
+          - lambda: |-
+              id(last_can_frame_ms) = millis();
+              if (x.size() >= 4) {
+
+                const uint16_t raw_discharge = (uint16_t) (((x[0] << 2) | (x[1] >> 6)) & 0x3FF);
+                const float d = raw_discharge * 0.25f;
+
+                const uint16_t raw_charge = (uint16_t) ((((x[1] & 0x3F) << 4) | (x[2] >> 4)) & 0x3FF);
+                const float c = raw_charge * 0.25f;
+
+                const uint16_t raw_charger = (uint16_t) ((((x[2] & 0x0F) << 6) | ((x[3] >> 2) & 0x3F)) & 0x3FF);
+                const float charger = (raw_charger * 0.1f) - 10.0f;
+
+                static uint32_t log_ms = 0;
+                const uint32_t now_ms = millis();
+                if (now_ms - log_ms > 10000) {
+                  log_ms = now_ms;
+                  ESP_LOGI("leaf_1DC", "discharge=%.2f kW charge=%.2f kW charger=%.1f kW  raw=[%02X %02X %02X %02X]",
+                           d, c, charger, (unsigned) x[0], (unsigned) x[1], (unsigned) x[2], (unsigned) x[3]);
+                }
+
+                if (d > 0 && d < 200) {
+                  if (id(last_discharge_limit) == 0.0f || fabs(d - id(last_discharge_limit)) >= 0.25f) {
+                    id(last_discharge_limit) = d;
+                    id(discharge_limit_sensor).publish_state(d);
+                  }
+                }
+
+                // NOTE: the mask on x[1] is mandatory (6 usable bits)
+                if (c > 0 && c < 120) {
+                  if (id(last_charge_limit) == 0.0f || fabs(c - id(last_charge_limit)) >= 0.25f) {
+                    id(last_charge_limit) = c;
+                    id(charge_limit_sensor).publish_state(c);
+                  }
+                }
+              }
+
+      # --------------------------------------------------------------------------
+      # 0x390 - OBC : maximum charge power
+      #   DBC 912 : OBC_Maximum_Charge_Power_Out 40|9@0+ -> ((x[5] & 0x01) << 8) | x[6]
+      #             OBC_Status_AC_Voltage        27|2@1+ -> (x[3] >> 3) & 0x03
+      #                        0 = No Signal, 1 = 100V, 2 = 200V, 3 = Abnormal Wave
+      # --------------------------------------------------------------------------
+      - can_id: 0x390
+        use_extended_id: false
+        then:
+          - lambda: |-
+              id(last_can_frame_ms) = millis();
+              if (x.size() >= 7) {
+                const uint8_t ac_voltage = (x[3] >> 3) & 0x03;
+                const uint16_t raw = (uint16_t) (((x[5] & 0x01) << 8) | x[6]);
+                const float obc_power_kw = raw * 0.1f;
+
+                static uint32_t log_ms = 0;
+                const uint32_t now_ms = millis();
+                if (now_ms - log_ms > 5000) {
+                  log_ms = now_ms;
+                  ESP_LOGI("leaf_390", "ac_voltage=%u raw=%u -> %.1f kW",
+                           (unsigned) ac_voltage, (unsigned) raw, obc_power_kw);
+                }
+
+                // The value is only meaningful while an AC voltage is present.
+                // REVISION 3: published only when it changes (this frame
+                // arrives several times per second).
+                if (ac_voltage == 1 || ac_voltage == 2) {
+                  if (obc_power_kw > 0.0f && obc_power_kw <= 50.0f) {
+                    if (fabs(obc_power_kw - id(last_obc_power)) >= 0.05f) {
+                      id(last_obc_power) = obc_power_kw;
+                      id(obc_max_power_sensor).publish_state(obc_power_kw);
+                    }
+                  } else if (id(last_obc_power) != 0.0f) {
+                    id(last_obc_power) = 0.0f;
+                    id(obc_max_power_sensor).publish_state(0.0f);
+                  }
+                } else if (id(last_obc_power) != 0.0f) {
+                  // no AC / abnormal wave -> publish 0, never a stale value
+                  id(last_obc_power) = 0.0f;
+                  id(obc_max_power_sensor).publish_state(0.0f);
+                }
+              }
+
+      # --------------------------------------------------------------------------
+      # 0x54A - HVAC : ambient temperature of the AC sensor
+      #   DBC 1354 : AmbientTempAC 56|8@1+ -> x[7]
+      #               CM_ : "Appears to track ambient (+41)"  => ambient = x[7] - 41
+      # --------------------------------------------------------------------------
+      - can_id: 0x54A
+        use_extended_id: false
+        then:
+          - lambda: |-
+              id(last_can_frame_ms) = millis();
+              if (x.size() >= 8) {
+                if (x[7] != 0xFF) {
+                  const float temp_ac = x[7] - 41.0f;
+                  if (temp_ac > -30.0f && temp_ac < 60.0f) {
+                    // REVISION 3: published only when it really changes
+                    // (this frame arrives several times per second).
+                    if (fabs(temp_ac - id(last_ambient_ac)) >= 0.2f) {
+                      id(last_ambient_ac) = temp_ac;
+                      id(ambient_ac_sensor).publish_state(temp_ac);
+                    }
+                    static uint32_t log_ms = 0;
+                    const uint32_t now_ms = millis();
+                    if (now_ms - log_ms > 10000) {
+                      log_ms = now_ms;
+                      ESP_LOGI("leaf_54A", "ambient AC = %.1f C (raw %u)", temp_ac, (unsigned) x[7]);
+                    }
+                  }
+                }
+              }
+
+      # --------------------------------------------------------------------------
+      # 0x54B - HVAC : climate control status / fan / vent / intake
+      #   DBC 1355 : ClimateControlStatus1 0|8@1+  -> x[0]
+      #                          0x00/0x10 = CC On, 0x01/0x11 = CC Off
+      #             ClimateVentModeTarget 16|8@1+ -> x[2]
+      #                          128 CC OFF, 136 Face, 144 Face/Feet, 152 Feet,
+      #                          160 Feet/Defrost, 168 Defrost
+      #             ClimateVentModeIntake 24|8@1+ -> x[3]
+      #                          0 Off, 9 Recirculate, 18 Fresh air, 146 Defrost
+      #             FanSpeed 35|5@1+ -> (x[4] >> 3) & 0x1F  (0..7)
+      # --------------------------------------------------------------------------
+      - can_id: 0x54B
+        use_extended_id: false
+        then:
+          - lambda: |-
+              id(last_can_frame_ms) = millis();
+              if (x.size() >= 5) {
+                const uint8_t cc = x[0];
+                // DBC 1355 : FanSpeed 35|5@1+ -> (x[4] >> 3) & 0x1F, range 1..7.
+                // On this car the 2 upper bits of that 5 bit field carry other
+                // flags, so only the low 3 bits are the fan speed (0..7).
+                const uint8_t fan_raw = (x[4] >> 3) & 0x1F;
+                const uint8_t fan_speed = fan_raw & 0x07;
+
+                if (fan_raw != id(last_fan_raw)) {
+                  id(last_fan_raw) = fan_raw;
+                  ESP_LOGI("leaf_54B", "cc=0x%02X vent=%u intake=%u fan_raw=%u fan=%u  raw=[%02X %02X %02X %02X %02X]",
+                           (unsigned) cc, (unsigned) x[2], (unsigned) x[3], (unsigned) fan_raw, (unsigned) fan_speed,
+                           (unsigned) x[0], (unsigned) x[1], (unsigned) x[2], (unsigned) x[3], (unsigned) x[4]);
+                }
+
+                static uint32_t log_ms = 0;
+                const uint32_t now_ms = millis();
+                if (now_ms - log_ms > 10000) {
+                  log_ms = now_ms;
+                  ESP_LOGI("leaf_54B", "cc=0x%02X vent=%u intake=%u fan_raw=%u fan=%u  raw=[%02X %02X %02X %02X %02X]",
+                           (unsigned) cc, (unsigned) x[2], (unsigned) x[3], (unsigned) fan_raw, (unsigned) fan_speed,
+                           (unsigned) x[0], (unsigned) x[1], (unsigned) x[2], (unsigned) x[3], (unsigned) x[4]);
+                }
+
+                // --- Fan speed (0..7) ---
+                // REVISION 3: published only when it changes.
+                if (fan_speed != id(last_fan_speed)) {
+                  id(last_fan_speed) = fan_speed;
+                  id(hvac_fan_sensor).publish_state((fan_speed / 7.0f) * 100.0f);
+                }
+
+                // --- Climate control master status (byte 0) ---
+                // DBC 1355 : 0x00/0x10 = "CC On", 0x01/0x11 = "CC Off".
+                // REVISION 3: on this car the byte 0 said "On" while the vent
+                // mode target was 128 ("CC OFF") and everything was really
+                // off (0 kW AC, 0 kW heater, 0 V fan, 0 % fan speed), so the
+                // "On" is only published when the vent mode target does not
+                // contradict it.
+                // The text sensors are also published only when they change.
+                static int last_hvac_code = -1;
+                int hvac_code = 2;
+                const char *hvac_text = "Unknown";
+                if (x[2] == 128) {
+                  hvac_code = 0;
+                  hvac_text = "Off";
+                } else if (cc == 0x00 || cc == 0x10) {
+                  hvac_code = 1;
+                  hvac_text = "On";
+                } else if (cc == 0x01 || cc == 0x11) {
+                  hvac_code = 0;
+                  hvac_text = "Off";
+                }
+                if (hvac_code != last_hvac_code) {
+                  last_hvac_code = hvac_code;
+                  id(hvac_status_sensor).publish_state(hvac_text);
+                }
+
+                // --- Vent mode (published only when it changes) ---
+                static int last_vent_code = -1;
+                const char *vent_text = "Unknown";
+                if (x[2] == 128)      vent_text = "CC OFF";
+                else if (x[2] == 136) vent_text = "Face";
+                else if (x[2] == 144) vent_text = "Face/Feet";
+                else if (x[2] == 152) vent_text = "Feet";
+                else if (x[2] == 160) vent_text = "Feet/Defrost";
+                else if (x[2] == 168) vent_text = "Defrost";
+                if ((int) x[2] != last_vent_code) {
+                  last_vent_code = (int) x[2];
+                  id(hvac_vent_mode_sensor).publish_state(vent_text);
+                }
+
+                // --- Intake mode (published only when it changes) ---
+                static int last_intake_code = -1;
+                const char *intake_text = "Unknown";
+                if (x[3] == 0)        intake_text = "Off";
+                else if (x[3] == 9)   intake_text = "Recirculation";
+                else if (x[3] == 18)  intake_text = "Fresh Air";
+                else if (x[3] == 146) intake_text = "Defrost";
+                if ((int) x[3] != last_intake_code) {
+                  last_intake_code = (int) x[3];
+                  id(hvac_intake_mode_sensor).publish_state(intake_text);
+                }
+              }
+
+      # --------------------------------------------------------------------------
+      # 0x54C - HVAC : ambient / evaporator / fan voltage / CC+AC+defrost flags
+      #   DBC 1356 : OutsideAmbientTemperature 48|8@1+ -> x[6] * 0.5 - 40.5
+      #             ACEvaporatorTemperature     0|8@1+  -> x[0] (scale uncertain,
+      #                          DBC says "0.25C/bit?" -> candidate 0.125 used here,
+      #                          raw value is logged so it can be validated)
+      #             FanVoltage                 40|8@1+  -> x[5] * 0.05
+      #             CC_ClimateControlStatus    10|1@1+  -> x[1] bit 2
+      #             CC_ACStatus                11|1@1+  -> x[1] bit 3
+      #             CC_BackScreenDefrost        9|1@1+  -> x[1] bit 1
+      # --------------------------------------------------------------------------
+      - can_id: 0x54C
+        use_extended_id: false
+        then:
+          - lambda: |-
+              id(last_can_frame_ms) = millis();
+              if (x.size() >= 7) {
+                static uint32_t log_ms = 0;
+                const uint32_t now_ms = millis();
+                if (now_ms - log_ms > 1000) {
+                  log_ms = now_ms;
+                  ESP_LOGI("leaf_54C", "raw=[%02X %02X %02X %02X %02X %02X %02X %02X]",
+                           (unsigned) x[0], (unsigned) x[1], (unsigned) x[2], (unsigned) x[3],
+                           (unsigned) x[4], (unsigned) x[5], (unsigned) x[6], (unsigned) x[7]);
+                }
+
+                // --- Ambient temperature (outside sensor) ---
+                // REVISION 3: published only when it changes.
+                if (x[6] != 0xFF) {
+                  const float temp = (x[6] * 0.5f) - 40.5f;
+                  if (temp > -30.0f && temp < 60.0f) {
+                    if (fabs(temp - id(last_ambient_temp)) >= 0.2f) {
+                      id(last_ambient_temp) = temp;
+                      id(ambient_temp_sensor).publish_state(temp);
+                    }
+                  }
+                }
+
+                // --- Evaporator temperature (scale = 0.125 C/bit, to be validated) ---
+                const float evap_temp = x[0] * 0.125f;
+                if (evap_temp >= -30.0f && evap_temp <= 80.0f) {
+                  if (fabs(evap_temp - id(last_evaporator_temp)) >= 0.2f) {
+                    id(last_evaporator_temp) = evap_temp;
+                    id(evaporator_temp_sensor).publish_state(evap_temp);
+                  }
+                }
+                // --- Fan voltage: commanded value, 0 when the fan is stopped ---
+                float fan_voltage = x[5] * 0.05f;
+                if (id(last_fan_speed) == 0) {
+                  fan_voltage = 0.0f;
+                }
+                if (fan_voltage >= 0.0f && fan_voltage <= 16.0f) {
+                  if (fabs(fan_voltage - id(last_fan_voltage)) >= 0.1f) {
+                    id(last_fan_voltage) = fan_voltage;
+                    id(fan_voltage_sensor).publish_state(fan_voltage);
+                  }
+                }
+
+                // --- Climate control / AC / defrost flags (byte 1) ---
+                // REVISION 3: on this car the byte 1 is 0xFF when the HVAC is
+                // off (it is a padding byte, not a state).  Decoded as a bit
+                // field it produced three false "On" (CC + AC + defrost) while
+                // the car was really off (0 kW AC, 0 kW heater, 0 V fan).
+                // A 0xFF byte is therefore published as "Unknown".
+                // The text sensors are published only when they change.
+                static int last_cc_code = -1;
+                static int last_ac_code = -1;
+                static int last_defrost_code = -1;
+                if (x[1] == 0xFF) {
+                  if (last_cc_code != 0xFF) {
+                    last_cc_code = 0xFF;
+                    id(climate_control_status_sensor).publish_state("Unknown");
+                  }
+                  if (last_ac_code != 0xFF) {
+                    last_ac_code = 0xFF;
+                    id(ac_status_sensor).publish_state("Unknown");
+                  }
+                  if (last_defrost_code != 0xFF) {
+                    last_defrost_code = 0xFF;
+                    id(hvac_defrost_sensor).publish_state("Unknown");
+                  }
+                } else {
+                  const bool cc_on   = (x[1] & 0x04) != 0;
+                  const bool ac_on   = (x[1] & 0x08) != 0;
+                  const bool defrost = (x[1] & 0x02) != 0;
+
+                  if (last_cc_code != (int) cc_on) {
+                    last_cc_code = (int) cc_on;
+                    id(climate_control_status_sensor).publish_state(cc_on ? "On" : "Off");
+                  }
+                  if (last_ac_code != (int) ac_on) {
+                    last_ac_code = (int) ac_on;
+                    id(ac_status_sensor).publish_state(ac_on ? "On" : "Off");
+                  }
+                  if (last_defrost_code != (int) defrost) {
+                    last_defrost_code = (int) defrost;
+                    id(hvac_defrost_sensor).publish_state(defrost ? "On" : "Off");
+                  }
+                }
+              }
+
+      # --------------------------------------------------------------------------
+      # 0x54F - HVAC : cabin temperature + AC / heater power
+      #   DBC 1359 : InteriorIntakeTemp     0|8@1+ -> x[0] * 0.5 - 14.0
+      #             ACPowerConsumption     8|8@1+ -> x[1] * 50 W
+      #             HeaterPowerConsumption 40|6@1+ -> (x[5] & 0x3F) * 300 W
+      #   NOTE: the cabin temperature is byte 0 (byte 3 does not exist in this
+      #         message on the ZE1).
+      #   The DBC offset (-14) gave 45 C, which is impossible in a car parked at
+      #   13 C ambient.  Every other temperature of this DBC uses -40 (-40.5 for
+      #   the outside sensor), and -40 gives 19 C for the same raw byte.
+      #   To go back to the DBC value, change - 40.0f to - 14.0f below.
+      # --------------------------------------------------------------------------
+      - can_id: 0x54F
+        use_extended_id: false
+        then:
+          - lambda: |-
+              id(last_can_frame_ms) = millis();
+              if (x.size() >= 6) {
+                // --- Cabin temperature ---
+                // DBC 1359 : InteriorIntakeTemp 0|8@1+ (0.5, -14).  With the
+                // DBC offset the car reported 45 C, which is impossible; all
+                // the other temperatures of this DBC use -40 (-40.5 for the
+                // outside sensor) and that gives 19 C in the same frame.
+                const float cabin_temp = (x[0] * 0.5f) - 40.0f;
+                if (cabin_temp > -20.0f && cabin_temp < 60.0f) {
+                  // REVISION 3: published only when it changes.
+                  if (fabs(cabin_temp - id(last_cabin_temp)) >= 0.2f) {
+                    id(last_cabin_temp) = cabin_temp;
+                    id(cabin_temp_sensor).publish_state(cabin_temp);
+                  }
+                }
+
+                static uint32_t log_ms = 0;
+                const uint32_t now_ms = millis();
+                if (now_ms - log_ms > 5000) {
+                  log_ms = now_ms;
+                  ESP_LOGI("leaf_54F", "cabin=%.1fC ac=%.2fkW heater=%.2fkW  raw=[%02X %02X %02X %02X %02X %02X]",
+                           cabin_temp, (x[1] * 50.0f) / 1000.0f, ((x[5] & 0x3F) * 300.0f) / 1000.0f,
+                           (unsigned) x[0], (unsigned) x[1], (unsigned) x[2], (unsigned) x[3], (unsigned) x[4], (unsigned) x[5]);
+                }
+
+                // --- AC power ---
+                const float ac_power_kw = (x[1] * 50.0f) / 1000.0f;
+                if (ac_power_kw >= 0.0f && ac_power_kw <= 15.0f) {
+                  if (fabs(ac_power_kw - id(last_ac_power)) >= 0.05f) {
+                    id(last_ac_power) = ac_power_kw;
+                    id(ac_power_sensor).publish_state(ac_power_kw);
+                  }
+                }
+
+                // --- Heater power ---
+                const float heater_power_kw = ((x[5] & 0x3F) * 300.0f) / 1000.0f;
+                if (heater_power_kw >= 0.0f && heater_power_kw <= 15.0f) {
+                  if (fabs(heater_power_kw - id(last_heater_power)) >= 0.05f) {
+                    id(last_heater_power) = heater_power_kw;
+                    id(heater_power_sensor).publish_state(heater_power_kw);
+                  }
+                }
+              }
+
+      # --------------------------------------------------------------------------
+      # 0x55A - INVERTER : temperatures (raw in 0.5 C steps)
+      #   DBC 1370 : InverterComBoardTemp     8|8@1+ -> x[1]
+      #             IGBTTemperature          16|8@1+ -> x[2]
+      #             IGBTDriverBoardTemperature 24|8@1+ -> x[3]
+      #             MotorTemperature         40|8@1+ -> x[5]   <-- byte 5, not 4
+      # --------------------------------------------------------------------------
+      - can_id: 0x55A
+        use_extended_id: false
+        then:
+          - lambda: |-
+              id(last_can_frame_ms) = millis();
+              if (x.size() >= 6) {
+                const float inverter_temp = x[1] / 2.0f;
+                const float igbt_temp = x[2] / 2.0f;
+                const float igbt_driver_temp = x[3] / 2.0f;
+                // DBC 1370 : MotorTemperature 40|8@1+ -> x[5], but the comment in
+                // the DBC says "Stays at 0 on 2015 Leaf?" and on this car byte 5
+                // is always 0 while byte 4 holds a plausible value (0x55 = 42.5 C)
+                const uint8_t motor_raw = (x[5] != 0) ? x[5] : x[4];
+                const float motor_temp = motor_raw / 2.0f;
+
+                static uint32_t log_ms = 0;
+                const uint32_t now_ms = millis();
+                if (now_ms - log_ms > 5000) {
+                  log_ms = now_ms;
+                  ESP_LOGI("leaf_55A", "inv=%.1f igbt=%.1f drv=%.1f motor=%.1f (raw x4=%u x5=%u)  raw=[%02X %02X %02X %02X %02X %02X]",
+                           inverter_temp, igbt_temp, igbt_driver_temp, motor_temp, (unsigned) x[4], (unsigned) x[5],
+                           (unsigned) x[0], (unsigned) x[1], (unsigned) x[2], (unsigned) x[3], (unsigned) x[4], (unsigned) x[5]);
+                }
+
+                // REVISION 3: published only when they change (this frame
+                // arrives several times per second).
+                if (inverter_temp > -30.0f && inverter_temp < 120.0f) {
+                  if (id(last_inv_temp) == 0.0f || fabs(inverter_temp - id(last_inv_temp)) < 10.0f) {
+                    if (fabs(inverter_temp - id(last_inv_temp)) >= 0.3f) {
+                      id(last_inv_temp) = inverter_temp;
+                      id(inverter_temp_sensor).publish_state(inverter_temp);
+                    }
+                  }
+                }
+
+                if (igbt_temp > -30.0f && igbt_temp < 120.0f) {
+                  if (fabs(igbt_temp - id(last_igbt_temp)) >= 0.3f) {
+                    id(last_igbt_temp) = igbt_temp;
+                    id(igbt_temp_sensor).publish_state(igbt_temp);
+                  }
+                }
+
+                if (igbt_driver_temp > -30.0f && igbt_driver_temp < 120.0f) {
+                  if (fabs(igbt_driver_temp - id(last_igbt_driver_temp)) >= 0.3f) {
+                    id(last_igbt_driver_temp) = igbt_driver_temp;
+                    id(igbt_driver_temp_sensor).publish_state(igbt_driver_temp);
+                  }
+                }
+
+                if (motor_temp > -30.0f && motor_temp < 120.0f && motor_temp != 0.0f) {
+                  if (fabs(motor_temp - id(last_motor_temp)) >= 0.3f) {
+                    id(last_motor_temp) = motor_temp;
+                    id(motor_temp_sensor).publish_state(motor_temp);
+                  }
+                }
+              }
+
+      # --------------------------------------------------------------------------
+      # 0x55B - LBC : LEGACY SOC  (do NOT use for the dashboard)
+      #   DBC 1371 : LB_SOC 7|10@0+ -> ((x[0] << 2) | (x[1] >> 6)) / 10 %
+      #   CM_      : "used on startup by Leaf Spy Pro and then ignored ... it is
+      #               seemingly used nowhere in the car"
+      #   The usable SOC (0x1DB) is the value used by the dash / ABB chargers.
+      # --------------------------------------------------------------------------
+      - can_id: 0x55B
+        use_extended_id: false
+        then:
+          - lambda: |-
+              id(last_can_frame_ms) = millis();
+              if (x.size() >= 2) {
+                const uint16_t raw = (uint16_t) (((x[0] << 2) | (x[1] >> 6)) & 0x3FF);
+
+                if (raw != 0x3FF) {
+                  const float soc = raw / 10.0f;
+                  if (soc >= 0.0f && soc <= 100.0f) {
+                    // only publish on change (0x55B is sent at high rate and
+                    // every change would create a new row in the HA database)
+                    if (fabs(soc - id(last_lbc_soc)) >= 0.05f) {
+                      id(last_lbc_soc) = soc;
+                      id(lbc_soc_sensor).publish_state(soc);
+                    }
+                    static uint32_t log_ms = 0;
+                    const uint32_t now_ms = millis();
+                    if (now_ms - log_ms > 10000) {
+                      log_ms = now_ms;
+                      ESP_LOGI("leaf_55B", "legacy LBC SOC = %.1f %%  raw=[%02X %02X]", soc, (unsigned) x[0], (unsigned) x[1]);
+                    }
+                  }
+                }
+              }
+
+      # --------------------------------------------------------------------------
+      # 0x59E - LBC : full / remaining capacity for QC
+      #   DBC 1438 : LB_Full_Capacity_for_QC  20|9@0+ -> ((x[2] & 0x1F) << 4) | (x[3] >> 4)
+      #             LB_Remain_Capacity_for_QC 27|9@0+ -> ((x[3] & 0x0F) << 5) | (x[4] >> 3)
+      #   (both in units of 100 Wh)
+      #   NOTE: the 3 "invented" charge time estimates (3 kW / 6 kW / QC) were
+      #         removed - the real value now comes from 0x5BC (LB_Remain_Charge_Time).
+      # --------------------------------------------------------------------------
+      - can_id: 0x59E
+        use_extended_id: false
+        then:
+          - lambda: |-
+              id(last_can_frame_ms) = millis();
+              if (x.size() >= 8) {
+                // REVISION 3: the 0x5BC cross check is only used while this
+                // capacity data is fresh (less than 60 s old)
+                id(last_59e_ms) = millis();
+
+                const uint16_t raw_full = (uint16_t) (((x[2] & 0x1F) << 4) | (x[3] >> 4));
+                const float full_wh = raw_full * 100.0f;
+
+                const uint16_t raw_remain = (uint16_t) (((x[3] & 0x0F) << 5) | (x[4] >> 3));
+                const float remain_wh = raw_remain * 100.0f;
+
+                static uint32_t log_ms = 0;
+                const uint32_t now_ms = millis();
+                if (now_ms - log_ms > 10000) {
+                  log_ms = now_ms;
+                  ESP_LOGI("leaf_59E", "full=%.0f Wh remain=%.0f Wh  raw=[%02X %02X %02X %02X %02X]", full_wh, remain_wh,
+                           (unsigned) x[0], (unsigned) x[1], (unsigned) x[2], (unsigned) x[3], (unsigned) x[4]);
+                }
+
+                // REVISION 3: the values are only published when they change.
+                // The 0x59E arrives several times per second and every
+                // publish creates a new row in the HA database.
+                if (full_wh > 10000.0f && full_wh < 70000.0f) {
+                  if (fabs(full_wh - id(full_capacity_wh)) >= 1.0f) {
+                    id(full_capacity_wh) = full_wh;
+                    id(full_capacity_sensor).publish_state(full_wh / 1000.0f);
+                  }
+                }
+
+                if (remain_wh > 0.0f && remain_wh < 70000.0f) {
+                  if (fabs(remain_wh - id(remaining_energy_wh)) >= 1.0f) {
+                    id(remaining_energy_wh) = remain_wh;
+                    id(remaining_energy_sensor).publish_state(remain_wh / 1000.0f);
+                  }
+                }
+
+                if (id(full_capacity_wh) > 10000.0f && id(remaining_energy_wh) > 0.0f) {
+                  const float calculated_soc = (id(remaining_energy_wh) / id(full_capacity_wh)) * 100.0f;
+                  if (calculated_soc >= 0.0f && calculated_soc <= 100.0f &&
+                      fabs(calculated_soc - id(last_calculated_soc)) >= 0.05f) {
+                    id(last_calculated_soc) = calculated_soc;
+                    id(calculated_energy_soc_sensor).publish_state(calculated_soc);
+                  }
+                }
+              }
+
+      # --------------------------------------------------------------------------
+      # 0x5BC - LBC : GIDs / SOH / dash gauge segment / remaining charge time
+      #   DBC 1468 : LB_Remain_Capacity_GIDS  7|10@0+  -> ((x[0] << 2) | (x[1] >> 6))
+      #             LB_Capacity_Deterioration_Rate 33|7@1+ -> (x[4] >> 1) & 0x7F  (SOH)
+      #             LB_Temperature_Segment_For_Dash 24|8@1+ -> x[3] * 5/12   (%, NOT degC)
+      #             LB_Remain_Charge_Time 52|13@0+ -> ((x[6] & 0x1F) << 8) | x[5]  (minutes)
+      #             LB_Remain_Charge_Time_Condition 41|5@0+ -> ((x[5] & 0x03) << 3) | ((x[4] >> 5) & 0x07)
+      #
+      #   REVISION 3: this frame arrives in TWO variants on this car:
+      #     A : x[0]=0x35 x[1]=0x80 -> 214 GIDs = 17 120 Wh  (matches the 0x59E)
+      #     B : x[0]=0x7D x[1]=0x00 -> 500 GIDs = 40 000 Wh  (more than the pack)
+      #   Variant B is rejected by a physical cross check (GIDs x 80 Wh vs the
+      #   remaining energy of the 0x59E and vs the full capacity of the pack),
+      #   so the GIDs, the charge time and the condition stop jumping between
+      #   the real value and the garbage (214 <-> 500, 513 <-> 1 min, ...).
+      # --------------------------------------------------------------------------
+      - can_id: 0x5BC
+        use_extended_id: false
+        then:
+          - lambda: |-
+              if (x.size() >= 8) {
+                id(last_can_frame_ms) = millis();
+                const uint32_t now_ms = millis();
+
+                // --- raw decoding -----------------------------------------
+                const uint16_t gids = (uint16_t) (((x[0] << 2) | (x[1] >> 6)) & 0x3FF);
+                const float gids_wh = (float) gids * 80.0f;
+                const uint16_t charge_time = (uint16_t) (((x[6] & 0x1F) << 8) | x[5]);
+                const uint8_t cond = (uint8_t) (((x[5] & 0x03) << 3) | ((x[4] >> 5) & 0x07));
+
+                // --- variant gate (physical cross check) -------------------
+                bool gids_ok = (gids > 0 && gids <= 800);
+                const char *why = "ok";
+                if (gids_ok && id(full_capacity_wh) > 10000.0f) {
+                  if (gids_wh > id(full_capacity_wh) * 1.05f) {
+                    gids_ok = false;
+                    why = "GIDs above the capacity of the pack";
+                  }
+                }
+                if (gids_ok && id(remaining_energy_wh) > 1000.0f && (now_ms - id(last_59e_ms)) < 60000) {
+                  const float dev = fabs(gids_wh - id(remaining_energy_wh)) / id(remaining_energy_wh);
+                  if (dev > 0.05f) {
+                    gids_ok = false;
+                    why = "GIDs x 80 Wh does not match the remaining energy";
+                  }
+                }
+
+                static uint32_t log_ms = 0;
+                if (now_ms - log_ms > 2000) {
+                  log_ms = now_ms;
+                  ESP_LOGI("leaf_5BC", "%s gids=%u (%.0f Wh) t=%u cond=%u remain=%.0f Wh  raw=[%02X %02X %02X %02X %02X %02X %02X %02X]",
+                           gids_ok ? "ACCEPTED" : "REJECTED", (unsigned) gids, gids_wh,
+                           (unsigned) charge_time, (unsigned) cond, id(remaining_energy_wh),
+                           (unsigned) x[0], (unsigned) x[1], (unsigned) x[2], (unsigned) x[3],
+                           (unsigned) x[4], (unsigned) x[5], (unsigned) x[6], (unsigned) x[7]);
+                  if (!gids_ok) {
+                    ESP_LOGW("leaf_5BC", "variant rejected: %s", why);
+                  }
+                }
+
+                if (!gids_ok) {
+                  // the last good values are kept (the sensor does not jump)
+                  return;
+                }
+
+                // --- GIDs ---
+                // DBC 1468 + Leaf2018-CAN.pdf : "Nissan multiplies this value by
+                // 80 Wh to get the current capacity of the HV Battery"
+                // (0-498 GIDs for a 40 kWh pack).  This is the REMAINING
+                // capacity in GIDs, so it goes UP while the car is charging.
+                if ((int) gids != id(last_gids)) {
+                  id(last_gids) = gids;
+                  id(gids_sensor).publish_state(gids);
+                }
+
+                // --- SOC calculated from the GIDs (1 GID = 80 Wh) ---
+                if (id(full_capacity_wh) > 10000.0f) {
+                  const float soc_gids = (gids_wh / id(full_capacity_wh)) * 100.0f;
+                  if (soc_gids >= 0.0f && soc_gids <= 100.0f) {
+                    if (fabs(soc_gids - id(last_soc_gids)) >= 0.05f) {
+                      id(last_soc_gids) = soc_gids;
+                      id(soc_gids_sensor).publish_state(soc_gids);
+                    }
+                  }
+                }
+
+                // --- SOH ---
+                const uint8_t soh = (x[4] >> 1) & 0x7F;
+                if (soh > 0 && soh <= 100 && (int) soh != id(last_soh)) {
+                  id(last_soh) = soh;
+                  id(soh_sensor).publish_state(soh);
+                }
+
+                // --- Dash gauge segment (%) ---
+                const float gauge = x[3] * (5.0f / 12.0f);
+                if (gauge >= 0.0f && gauge <= 100.0f) {
+                  // published only when it changes (the frame arrives several
+                  // times per second and the value oscillates by 1 step)
+                  if (fabs(gauge - id(last_gauge_segment)) > 0.01f) {
+                    id(last_gauge_segment) = gauge;
+                    id(battery_gauge_segment_sensor).publish_state(gauge);
+                    ESP_LOGI("leaf_5BC", "gauge segment = %.1f %%", gauge);
+                  }
+                }
+
+                // --- Remaining charge time (minutes) ---
+                // DBC: 52|13@0+ -> ((x[6] & 0x1F) << 8) | x[5], 0x1FFF = unavailable
+                // The signal shares the bytes with LB_Remain_Charge_Time_Condition
+                // (a mux for the charge time), so it only makes sense in a frame
+                // that passed the variant gate.  The physical range is checked
+                // as well: with 16.9 kWh left and a maximum of 60 kW the charge
+                // time can not be shorter than 17 minutes (the garbage values
+                // were 1, 16 and 17 minutes).
+                const float t_min = (id(remaining_energy_wh) > 1000.0f) ? (id(remaining_energy_wh) / 1000.0f) : 10.0f;
+                if (charge_time != 0x1FFF && (float) charge_time >= t_min && charge_time <= 720) {
+                  // published only when it changes
+                  if (fabs((float) charge_time - id(last_charge_time)) > 0.5f) {
+                    id(last_charge_time) = charge_time;
+                    id(remaining_charge_time_sensor).publish_state(charge_time);
+                    ESP_LOGI("leaf_5BC", "remaining charge time = %u min", (unsigned) charge_time);
+                  }
+                }
+
+                // --- Remaining charge time condition ---
+                // DBC 1468 : VAL_ 0 Quickcharge, 5 Normal Charge 6kW Full,
+                // 8 Normal Charge 200V Full, 11 Normal Charge 100V Full,
+                // 18 Normal Charge 6kW 80%, 21 Normal Charge 200V 80%,
+                // 24 Normal Charge 100V 80%
+                // published only when it changes
+                if (cond != id(last_charge_time_condition)) {
+                  id(last_charge_time_condition) = cond;
+                  ESP_LOGI("leaf_5BC", "charge time condition = %u", (unsigned) cond);
+                  if (cond == 0)       id(charge_time_condition_sensor).publish_state("Quickcharge");
+                  else if (cond == 5)  id(charge_time_condition_sensor).publish_state("Normal Charge 6kW Full");
+                  else if (cond == 8)  id(charge_time_condition_sensor).publish_state("Normal Charge 200V Full");
+                  else if (cond == 11) id(charge_time_condition_sensor).publish_state("Normal Charge 100V Full");
+                  else if (cond == 18) id(charge_time_condition_sensor).publish_state("Normal Charge 6kW 80%");
+                  else if (cond == 21) id(charge_time_condition_sensor).publish_state("Normal Charge 200V 80%");
+                  else if (cond == 24) id(charge_time_condition_sensor).publish_state("Normal Charge 100V 80%");
+                  else                 id(charge_time_condition_sensor).publish_state("Unknown");
+                }
+              }
+
+      # --------------------------------------------------------------------------
+      # 0x5C0 - LBC : battery historical data / heater requests
+      #   DBC 1472 : LB_Historical_Data_Swich_Flag 0|3@1+ -> x[0] & 0x07  (mux)
+      #             LB_HistData_Temp_WakeupPhase_*  9|7@1+ -> (x[1] >> 1) & 0x7F - 40
+      #             LB_HistData_Temperature_*       17|7@1+ -> (x[2] >> 1) & 0x7F - 40
+      #             LB_HEATEXIST                   32|1@1+ -> x[4] & 0x01
+      #             LB_Diagnosis_Trouble_Code       56|8@1+ -> x[7]
+      #   The mux selects MIN (3) / MAX (1) / AVG (2) for the temperature fields.
+      #   The filter was widened to mux <= 6 and the frame is logged so the real
+      #   mux used by this car can be identified.
+      # --------------------------------------------------------------------------
+      - can_id: 0x5C0
+        use_extended_id: false
+        then:
+          - lambda: |-
+              id(last_can_frame_ms) = millis();
+              if (x.size() >= 8) {
+                const uint8_t mux = x[0] & 0x07;
+
+                static uint32_t log_ms = 0;
+                const uint32_t now_ms = millis();
+                if (now_ms - log_ms > 1000) {
+                  log_ms = now_ms;
+                  ESP_LOGI("leaf_5C0", "mux=%u  raw=[%02X %02X %02X %02X %02X %02X %02X %02X]",
+                           (unsigned) mux, (unsigned) x[0], (unsigned) x[1], (unsigned) x[2], (unsigned) x[3], (unsigned) x[4], (unsigned) x[5], (unsigned) x[6], (unsigned) x[7]);
+                }
+
+                // The DBC declares the mux between 0 and 6 (0 = MIN, 1 = MAX,
+                // 2 = AVG).  The previous filter (1..6) rejected the frames of
+                // this car, so every value of the 3 bit field is accepted.
+                // REVISION 3: on this car the byte with the temperature is
+                // 0xFF (the value is never published), the real pack
+                // temperatures come from the LBC group 4 answer.  This frame
+                // is only used as a fallback when no group 4 answer was
+                // received yet.
+                if (mux <= 7) {
+                  const float wakeup_temp = (float) (((x[1] >> 1) & 0x7F) - 40);
+                  const float hist_temp = (float) (((x[2] >> 1) & 0x7F) - 40);
+
+                  // published only when the value changes
+                  static float last_fallback_temp = -999.0f;
+                  static float last_wakeup_temp = -999.0f;
+
+                  if (!id(bms_group_4_ok) && hist_temp > -30.0f && hist_temp < 80.0f) {
+                    if (fabs(hist_temp - last_fallback_temp) >= 0.2f) {
+                      last_fallback_temp = hist_temp;
+                      id(battery_temp_sensor).publish_state(hist_temp);
+                      id(battery_temp_source_sensor).publish_state("0x5C0 (fallback)");
+                    }
+                  }
+                  if (wakeup_temp > -30.0f && wakeup_temp < 80.0f) {
+                    if (fabs(wakeup_temp - last_wakeup_temp) >= 0.2f) {
+                      last_wakeup_temp = wakeup_temp;
+                      id(battery_wakeup_temp_sensor).publish_state(wakeup_temp);
+                    }
+                  }
+                }
+
+                const bool heat_start_req = (x[0] & 0x20) != 0;
+                const bool heat_stop_req = (x[0] & 0x10) != 0;
+                const bool heater_mail_req = (x[1] & 0x01) != 0;
+                const bool battery_heater_exists = (x[4] & 0x01) != 0;
+
+                // published only when the flags change
+                static int last_heat_code = -1;
+                const int heat_code = (heat_start_req ? 1 : 0) | (heat_stop_req ? 2 : 0) |
+                                      (heater_mail_req ? 4 : 0) | (battery_heater_exists ? 8 : 0);
+                if (heat_code != last_heat_code) {
+                  last_heat_code = heat_code;
+                  id(battery_heater_start_sensor).publish_state(heat_start_req ? "Requested" : "No");
+                  id(battery_heater_stop_sensor).publish_state(heat_stop_req ? "Requested" : "No");
+                  id(battery_heater_mail_sensor).publish_state(heater_mail_req ? "Requested" : "No");
+                  id(battery_heater_exists_sensor).publish_state(battery_heater_exists ? "Yes" : "No");
+                }
+
+                static int last_dtc = -1;
+                if ((int) x[7] != last_dtc) {
+                  last_dtc = (int) x[7];
+                  id(battery_heater_dtc_sensor).publish_state(x[7]);
+                }
+              }
+
+      # --------------------------------------------------------------------------
+      # 0x7BB - LBC : multi frame (ISO-TP like) answers to the 0x79B requests
+      #   Frame layout used by the LBC (Leaf2018-CAN.pdf):
+      #     First Frame : 0x10 | len | 0x61 | group | data...
+      #     Consec.Frame: 0x2n | data...
+      #   content[0] = 0x61, content[1] = group, content[2..] = payload
+      #     content[0..5]   = first frame bytes 2..7
+      #     content[6..12]  = consecutive frame 1 bytes 1..7
+      #     content[13..19] = consecutive frame 2 bytes 1..7   ...
+      #   Group 1  -> SOC / AHR / HX (authoritative values of the LBC)
+      #   Group 4  -> the four HV battery pack temperatures
+      #   Group 6  -> 12 bytes of shunt bitmap  (content[2..13])
+      #   Group 61 -> SOH = ((content[6] << 8) | content[7]) / 100
+      #   The flow control is NOT sent from here (this runs in the CAN RX
+      #   task): the handler only raises bms_fc_pending and the frame is sent
+      #   from the main loop (esphome: on_loop) - and only if the LBC did not
+      #   send any consecutive frame in the meantime.
+      # --------------------------------------------------------------------------
+      - can_id: 0x7BB
+        use_extended_id: false
+        then:
+          - lambda: |-
+              static uint8_t bms_buffer[512] = {};
+              static uint16_t bms_expected_length = 0;
+              static uint16_t bms_received_length = 0;
+              static uint8_t bms_expected_sequence = 1;
+              static uint32_t bms_last_frame_ms = 0;
+              static uint8_t bms_current_group = 0;
+              static int bms_prev_shunt_count = -1;
+              static float bms_last_soh = -1.0f;
+
+              if (x.size() < 8) {
+                return;
+              }
+
+              id(last_can_frame_ms) = millis();
+
+              const uint32_t now = millis();
+
+              // timeout -> drop an incomplete message and ask for a new answer
+              if (bms_received_length > 0 && (now - bms_last_frame_ms) > 2000) {
+                ESP_LOGW("leaf_7BB", "timeout, dropping incomplete message (%u bytes)", (unsigned) bms_received_length);
+                bms_received_length = 0;
+                bms_expected_length = 0;
+                bms_current_group = 0;
+                id(bms_waiting_cf) = false;
+                id(bms_fc_pending) = false;
+                id(bms_retry_pending) = true;
+                return;
+              }
+
+              const uint8_t pci = x[0];
+
+              // ---------------------------------------------------------- First Frame
+              if ((pci & 0xF0) == 0x10) {
+                const uint16_t message_length = x[1];
+
+                if (message_length < 4 || message_length > sizeof(bms_buffer)) {
+                  ESP_LOGW("leaf_7BB", "bad length %u", (unsigned) message_length);
+                  bms_received_length = 0;
+                  bms_expected_length = 0;
+                  return;
+                }
+
+                bms_expected_length = message_length;
+                bms_received_length = 0;
+                bms_expected_sequence = 1;
+                bms_current_group = x[3];
+
+                for (uint8_t i = 0; i < 6 && bms_received_length < bms_expected_length; i++) {
+                  bms_buffer[bms_received_length++] = x[2 + i];
+                }
+
+                bms_last_frame_ms = now;
+                id(bms_ff_seen) = true;
+                id(bms_ff_ms) = now;
+                id(bms_waiting_cf) = true;
+                id(bms_retry_pending) = false;
+
+                ESP_LOGI("leaf_7BB", "First Frame len=%u group=0x%02X raw=[%02X %02X %02X %02X %02X %02X %02X %02X]",
+                         (unsigned) message_length, (unsigned) bms_current_group,
+                         (unsigned) x[0], (unsigned) x[1], (unsigned) x[2], (unsigned) x[3],
+                         (unsigned) x[4], (unsigned) x[5], (unsigned) x[6], (unsigned) x[7]);
+
+                // Group 61 -> the SOH can already be inside the first frame
+                // (ZE1: content[4..5] = x[6], x[7]).
+                if (bms_current_group == 0x61) {
+                  const float soh = (float) ((((uint16_t) x[6] << 8) | x[7]) / 100.0f);
+                  if (soh > 0.0f && soh <= 100.0f && fabs(soh - bms_last_soh) > 0.01f) {
+                    bms_last_soh = soh;
+                    id(last_bms_soh) = soh;
+                    ESP_LOGI("leaf_7BB", "LBC group 61 SOH = %.2f %%", soh);
+                    id(bms_soh_sensor).publish_state(soh);
+                  }
+                }
+
+                // The whole message may already be inside the first frame
+                if (bms_received_length >= bms_expected_length) {
+                  // -> the message is complete, continue below
+                } else {
+                  // ISO-TP flow control -> ask for the consecutive frames.
+                  // It is sent from the main loop (never from this RX task)
+                  // and only if the LBC does not send anything by itself.
+                  id(bms_fc_pending) = true;
+                  return;
+                }
+
+              } else if ((pci & 0xF0) == 0x20) {
+                // ---------------------------------------------------- Consecutive Frame
+                if (bms_expected_length == 0) {
+                  return;
+                }
+                if (bms_received_length >= bms_expected_length) {
+                  // the message was already completed, this frame is a leftover
+                  bms_received_length = 0;
+                  bms_expected_length = 0;
+                  bms_current_group = 0;
+                  return;
+                }
+                if ((pci & 0x0F) != bms_expected_sequence) {
+                  ESP_LOGW("leaf_7BB", "out of sequence frame %u (expected %u) - answer dropped",
+                           (unsigned) pci & 0x0F, (unsigned) bms_expected_sequence);
+                  bms_received_length = 0;
+                  bms_expected_length = 0;
+                  bms_current_group = 0;
+                  id(bms_waiting_cf) = false;
+                  id(bms_fc_pending) = false;
+                  id(bms_retry_pending) = true;
+                  return;
+                }
+
+                for (uint8_t i = 1; i < 8 && bms_received_length < bms_expected_length; i++) {
+                  bms_buffer[bms_received_length++] = x[i];
+                }
+                bms_expected_sequence = (bms_expected_sequence + 1) & 0x0F;
+                bms_last_frame_ms = now;
+                // the answer is streaming: no flow control must be sent now
+                id(bms_waiting_cf) = false;
+                id(bms_fc_pending) = false;
+
+                if (bms_received_length < bms_expected_length) {
+                  return;
+                }
+
+              } else {
+                return;
+              }
+
+              // -------------------------------------------------- message complete
+              id(bms_retry_count) = 0;
+              ESP_LOGI("leaf_7BB", "message complete: %u bytes, group 0x%02X", (unsigned) bms_received_length, (unsigned) bms_current_group);
+
+              if (bms_current_group == 0x01 && bms_received_length >= 40) {
+                // --- LBC group 1 : the authoritative values of the LBC ---
+                // Leaf2018-CAN.pdf :
+                //   HX  = ((data 24[4] << 8) | data 24[5]) / 102.4
+                //   SOC = (data 24[7] << 16 | (data 25[1] << 8 | data 25[2])) / 10000
+                //   AHR = (data 25[4] << 16 | (data 25[5] << 8 | data 25[6])) / 10000
+                // The PDF counts the bytes of the CAN frame (the PCI byte is
+                // byte 0), so the frame 0x24 (consecutive frame 4) starts at
+                // content[27]:  byte 4 -> content[30], byte 7 -> content[33]
+                // and the frame 0x25 starts at content[34].
+                const float hx = (float) (((bms_buffer[30] << 8) | bms_buffer[31]) / 102.4f);
+                const float soc = (float) ((((uint32_t) bms_buffer[33] << 16) |
+                                            ((uint32_t) bms_buffer[34] << 8) | bms_buffer[35]) / 10000.0f);
+                const float ahr = (float) ((((uint32_t) bms_buffer[37] << 16) |
+                                            ((uint32_t) bms_buffer[38] << 8) | bms_buffer[39]) / 10000.0f);
+
+                // sanity: the SOC is cross checked against the energy based SOC
+                bool soc_ok = (soc > 0.0f && soc <= 100.0f);
+                if (soc_ok && id(full_capacity_wh) > 10000.0f && id(remaining_energy_wh) > 1000.0f) {
+                  const float soc_energy = (id(remaining_energy_wh) / id(full_capacity_wh)) * 100.0f;
+                  if (fabs(soc - soc_energy) > 15.0f) {
+                    soc_ok = false;
+                    ESP_LOGW("leaf_7BB", "group 1 SOC %.2f %% does not match the energy SOC %.2f %% - ignored",
+                             soc, soc_energy);
+                  }
+                }
+
+                if (soc_ok) {
+                  id(lbc_group_1_soc) = soc;
+                  // published only when the value changes
+                  if (fabs(soc - id(last_group_1_soc)) >= 0.01f) {
+                    id(last_group_1_soc) = soc;
+                    id(lbc_group_1_soc_sensor).publish_state(soc);
+                  }
+                }
+                if (ahr > 1.0f && ahr < 500.0f) {
+                  id(lbc_group_1_ahr) = ahr;
+                  if (fabs(ahr - id(last_group_1_ahr)) >= 0.05f) {
+                    id(last_group_1_ahr) = ahr;
+                    id(battery_capacity_ahr_sensor).publish_state(ahr);
+                  }
+                }
+                if (hx > 0.0f && hx <= 100.0f) {
+                  id(lbc_group_1_hx) = hx;
+                  if (fabs(hx - id(last_group_1_hx)) >= 0.01f) {
+                    id(last_group_1_hx) = hx;
+                    id(battery_health_sensor).publish_state(hx);
+                  }
+                }
+                ESP_LOGI("leaf_7BB", "group 1: SOC=%.2f %% AHR=%.2f Ah HX=%.2f %%", soc, ahr, hx);
+              }
+
+              if (bms_current_group == 0x04 && bms_received_length >= 13) {
+                // --- LBC group 4 : the four HV battery pack temperatures ---
+                // Leaf2018-CAN.pdf :
+                //   Temp raw 1 = (data 10[4] << 8) | data 10[5]
+                //   Temp raw 2 = (data 10[7] << 8) | data 21[1]
+                //   Temp raw 3 = (data 21[3] << 8) | data 21[4]
+                //   Temp raw 4 = (data 21[6] << 8) | data 21[7]
+                //   Temp C = ((F(raw) - 32) * 5) / 9   (algorithm 1: raw -> degF)
+                const uint16_t raw1 = (uint16_t) ((bms_buffer[2] << 8) | bms_buffer[3]);
+                const uint16_t raw2 = (uint16_t) ((bms_buffer[5] << 8) | bms_buffer[6]);
+                const uint16_t raw3 = (uint16_t) ((bms_buffer[8] << 8) | bms_buffer[9]);
+                const uint16_t raw4 = (uint16_t) ((bms_buffer[11] << 8) | bms_buffer[12]);
+
+                // algorithm 1 of the PDF (raw -> degF), piecewise linear
+                auto raw_to_f = [](uint16_t i) -> float {
+                  if (i == 1021) {
+                    return 1.0f;
+                  } else if (i >= 589) {
+                    return 162.0f - (i * 0.181f);
+                  } else if (i >= 569) {
+                    return 57.2f + ((579 - i) * 0.18f);
+                  } else if (i >= 558) {
+                    return 60.8f + ((558 - i) * 0.16363636f);
+                  } else if (i >= 548) {
+                    return 62.6f + ((548 - i) * 0.18f);
+                  } else if (i >= 537) {
+                    return 64.4f + ((537 - i) * 0.16363636f);
+                  } else if (i >= 447) {
+                    return 66.2f + ((527 - i) * 0.18f);
+                  } else if (i >= 438) {
+                    return 82.4f + ((438 - i) * 0.2f);
+                  } else if (i >= 428) {
+                    return 84.2f + ((428 - i) * 0.18f);
+                  } else if (i >= 365) {
+                    return 86.0f + ((419 - i) * 0.2f);
+                  } else if (i >= 357) {
+                    return 98.6f + ((357 - i) * 0.225f);
+                  } else if (i >= 348) {
+                    return 100.4f + ((348 - i) * 0.2f);
+                  } else if (i >= 316) {
+                    return 102.2f + ((340 - i) * 0.225f);
+                  }
+                  return 109.4f + ((309 - i) * 0.25714286f);
+                };
+
+                float t1 = 0.0f, t2 = 0.0f, t3 = 0.0f, t4 = 0.0f;
+                bool v1 = false, v2 = false, v3 = false, v4 = false;
+
+                if (raw1 != 0xFFFF && raw1 < 1022) {
+                  t1 = ((raw_to_f(raw1) - 32.0f) * 5.0f) / 9.0f;
+                  v1 = (t1 > -40.0f && t1 < 90.0f);
+                }
+                if (raw2 != 0xFFFF && raw2 < 1022) {
+                  t2 = ((raw_to_f(raw2) - 32.0f) * 5.0f) / 9.0f;
+                  v2 = (t2 > -40.0f && t2 < 90.0f);
+                }
+                if (raw3 != 0xFFFF && raw3 < 1022) {
+                  t3 = ((raw_to_f(raw3) - 32.0f) * 5.0f) / 9.0f;
+                  v3 = (t3 > -40.0f && t3 < 90.0f);
+                }
+                if (raw4 != 0xFFFF && raw4 < 1022) {
+                  t4 = ((raw_to_f(raw4) - 32.0f) * 5.0f) / 9.0f;
+                  v4 = (t4 > -40.0f && t4 < 90.0f);
+                }
+
+                float sum = 0.0f;
+                int count = 0;
+                if (v1) { sum += t1; count++; }
+                if (v2) { sum += t2; count++; }
+                if (v3) { sum += t3; count++; }
+                if (v4) { sum += t4; count++; }
+
+                if (count > 0) {
+                  const float avg = sum / (float) count;
+                  id(bms_group_4_ok) = true;
+                  // published only when the value changes
+                  if (fabs(avg - id(last_pack_temp_avg)) >= 0.2f) {
+                    id(last_pack_temp_avg) = avg;
+                    id(battery_temp_sensor).publish_state(avg);
+                    id(battery_temp_source_sensor).publish_state("LBC group 4");
+                    id(battery_pack_temps_sensor).publish_state(
+                        str_sprintf("T1=%.1f T2=%.1f T3=%.1f T4=%.1f C (raw %u/%u/%u/%u)",
+                                    v1 ? t1 : 0.0f, v2 ? t2 : 0.0f, v3 ? t3 : 0.0f, v4 ? t4 : 0.0f,
+                                    (unsigned) raw1, (unsigned) raw2, (unsigned) raw3, (unsigned) raw4));
+                  }
+                  ESP_LOGI("leaf_7BB", "group 4 pack temps: %.1f / %.1f / %.1f / %.1f C (raw %u/%u/%u/%u)",
+                           v1 ? t1 : 0.0f, v2 ? t2 : 0.0f, v3 ? t3 : 0.0f, v4 ? t4 : 0.0f,
+                           (unsigned) raw1, (unsigned) raw2, (unsigned) raw3, (unsigned) raw4);
+                }
+              }
+
+              // NOTE: the SOH of the group 61 is already published above, when
+              // the first frame is received.  The PDF formula
+              // "SOH = ((data[6] << 8) | data[7]) / 100" counts the bytes of
+              // the CAN frame, so data[6] / data[7] are the last two bytes of
+              // the first frame (content[4..5]) and NOT the payload of the
+              // first consecutive frame (content[6..7]):
+              //   example of the PDF (0x7BB 11 4B 61 61 26 9A 25 CA)
+              //     -> 0x25CA / 100 = 96.74 %
+              //   this car -> 82.49 % (the 0x5BC reports 82 % for the same
+              //   battery), so the reading is confirmed.
+
+              if (bms_current_group == 0x06 && bms_received_length >= 14) {
+                // Group 6 : shunt bitmap, 12 bytes starting at content[2]
+                uint8_t nibbles[24];
+                for (uint8_t i = 0; i < 12; i++) {
+                  const uint8_t value = bms_buffer[2 + i];
+                  nibbles[i * 2] = value & 0x0F;
+                  nibbles[i * 2 + 1] = value >> 4;
+                }
+
+                const uint8_t shunt_order[4] = {8, 4, 2, 1};
+                int active_shunts = 0;
+                for (int i = 0; i < 96; i++) {
+                  if (nibbles[i / 4] & shunt_order[i % 4]) {
+                    active_shunts++;
+                  }
+                }
+
+                if (active_shunts != bms_prev_shunt_count) {
+                  bms_prev_shunt_count = active_shunts;
+                  id(bms_last_shunt_count) = active_shunts;
+                  ESP_LOGI("leaf_7BB", "group 6 active shunts = %d", (int) active_shunts);
+                  id(bms_group_6_active_shunts_sensor).publish_state(active_shunts);
+                }
+              }
+
+              bms_received_length = 0;
+              bms_expected_length = 0;
+              bms_current_group = 0;
+              id(bms_waiting_cf) = false;
+              id(bms_fc_pending) = false;
+
+# ==============================================================================
+# NUMERIC SENSORS
+# ==============================================================================
+sensor:
+
+  - platform: template
+    name: "LBC SOC"
+    id: lbc_soc_sensor
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:battery"
+
+  - platform: template
+    name: "Usable SOC"
+    id: usable_soc_sensor
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:battery"
+
+  - platform: template
+    name: "Calculated Energy SOC"
+    id: calculated_energy_soc_sensor
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:battery-sync"
+
+  - platform: template
+    name: "State of Health (SOH)"
+    id: soh_sensor
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: "mdi:heart-pulse"
+
+  - platform: template
+    name: "Battery SOH (LBC group 61)"
+    id: bms_soh_sensor
+    unit_of_measurement: "%"
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:heart-pulse-outline"
+
+  - platform: template
+    name: "GIDs"
+    id: gids_sensor
+    unit_of_measurement: "GIDs"
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: "mdi:car-battery"
+
+  - platform: template
+    name: "Remaining Energy"
+    id: remaining_energy_sensor
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:battery-charging"
+
+  - platform: template
+    name: "Full Capacity"
+    id: full_capacity_sensor
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:battery-high"
+
+  # REAL remaining charge time (LB_Remain_Charge_Time, 0x5BC, minutes)
+  - platform: template
+    name: "Remaining Charge Time"
+    id: remaining_charge_time_sensor
+    unit_of_measurement: "min"
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: "mdi:timer-sand"
+
+  - platform: template
+    name: "HV Battery Voltage"
+    id: battery_voltage_sensor
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:flash"
+
+  - platform: template
+    name: "HV Battery Current"
+    id: battery_current_sensor
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:current-dc"
+
+  - platform: template
+    name: "HV Instant Power"
+    id: hv_power_sensor
+    unit_of_measurement: "kW"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:lightning-bolt"
+
+  - platform: template
+    name: "Max Discharge Power"
+    id: discharge_limit_sensor
+    unit_of_measurement: "kW"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:battery-arrow-down"
+
+  - platform: template
+    name: "Max Charge Power"
+    id: charge_limit_sensor
+    unit_of_measurement: "kW"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:battery-arrow-up"
+
+  - platform: template
+    name: "OBC Max Power"
+    id: obc_max_power_sensor
+    unit_of_measurement: "kW"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:ev-plug-type2"
+
+  - platform: template
+    name: "Battery Temperature"
+    id: battery_temp_sensor
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:thermometer"
+
+  # REVISION 3: the real pack temperatures come from the LBC group 4 answer
+  - platform: template
+    name: "SOC (GIDs)"
+    id: soc_gids_sensor
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:battery-sync"
+
+  - platform: template
+    name: "Battery SOC (LBC group 1)"
+    id: lbc_group_1_soc_sensor
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:battery"
+
+  - platform: template
+    name: "Battery Capacity (Ah)"
+    id: battery_capacity_ahr_sensor
+    unit_of_measurement: "Ah"
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:battery-charging"
+
+  - platform: template
+    name: "Battery Health (HX)"
+    id: battery_health_sensor
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:heart-pulse"
+
+  - platform: template
+    name: "Battery Wakeup Temperature"
+    id: battery_wakeup_temp_sensor
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:thermometer-alert"
+
+  # RENAMED: this is the dash gauge segment in % (DBC: LB_Temperature_Segment_For_Dash)
+  - platform: template
+    name: "Battery Gauge Segment (dash)"
+    id: battery_gauge_segment_sensor
+    unit_of_measurement: "%"
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:gauge"
+
+  - platform: template
+    name: "Battery Heater DTC"
+    id: battery_heater_dtc_sensor
+    accuracy_decimals: 0
+    icon: "mdi:alert-circle-outline"
+
+  - platform: template
+    name: "Motor Temperature"
+    id: motor_temp_sensor
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:car-coolant-level"
+
+  - platform: template
+    name: "Inverter Temperature"
+    id: inverter_temp_sensor
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:engine"
+
+  - platform: template
+    name: "IGBT Temperature"
+    id: igbt_temp_sensor
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:thermometer"
+
+  - platform: template
+    name: "IGBT Driver Temperature"
+    id: igbt_driver_temp_sensor
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:thermometer"
+
+  - platform: template
+    name: "Ambient Temperature"
+    id: ambient_temp_sensor
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:sun-thermometer"
+
+  - platform: template
+    name: "Ambient Temperature AC"
+    id: ambient_ac_sensor
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:sun-thermometer"
+
+  - platform: template
+    name: "Cabin Temperature"
+    id: cabin_temp_sensor
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:car-seat-cooler"
+
+  - platform: template
+    name: "Evaporator Temperature"
+    id: evaporator_temp_sensor
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:snowflake-thermometer"
+
+  - platform: template
+    name: "HVAC Fan Speed"
+    id: hvac_fan_sensor
+    unit_of_measurement: "%"
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: "mdi:fan"
+
+  - platform: template
+    name: "Fan Voltage"
+    id: fan_voltage_sensor
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:fan"
+
+  - platform: template
+    name: "AC Power Consumption"
+    id: ac_power_sensor
+    unit_of_measurement: "kW"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:air-conditioner"
+
+  - platform: template
+    name: "Heater Power Consumption"
+    id: heater_power_sensor
+    unit_of_measurement: "kW"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:radiator"
+
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+
+  # --- BMS Sensor ---
+  - platform: template
+    name: "BMS Group 6 Active Shunts"
+    id: bms_group_6_active_shunts_sensor
+    unit_of_measurement: "cells"
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: "mdi:battery-sync"
+
+# ==============================================================================
+# TEXT SENSORS
+# ==============================================================================
+text_sensor:
+  # REVISION 3: source of the battery temperature (LBC group 4 = real pack
+  # temperatures, 0x5C0 = unreliable, the byte is 0xFF on this car)
+  - platform: template
+    name: "Battery Temperature Source"
+    id: battery_temp_source_sensor
+    icon: "mdi:source-branch"
+
+  # the four pack temperatures of the LBC group 4 answer
+  - platform: template
+    name: "Battery Pack Temperatures"
+    id: battery_pack_temps_sensor
+    icon: "mdi:thermometer-lines"
+
+  - platform: template
+    name: "Gear Shift"
+    id: gear_shift_sensor
+    icon: "mdi:car-shift-pattern"
+
+  - platform: template
+    name: "Car Status"
+    id: car_status_sensor
+    icon: "mdi:car-info"
+
+  - platform: template
+    name: "Charge Status"
+    id: charge_status_sensor
+    icon: "mdi:ev-station"
+
+  - platform: template
+    name: "HVAC Status"
+    id: hvac_status_sensor
+    icon: "mdi:air-conditioner"
+
+  - platform: template
+    name: "Climate Control Status"
+    id: climate_control_status_sensor
+    icon: "mdi:air-conditioner"
+
+  - platform: template
+    name: "AC Status"
+    id: ac_status_sensor
+    icon: "mdi:snowflake"
+
+  - platform: template
+    name: "HVAC Defrost"
+    id: hvac_defrost_sensor
+    icon: "mdi:car-defrost-front"
+
+  - platform: template
+    name: "HV Supply Status"
+    id: hv_supply_status_sensor
+    icon: "mdi:flash"
+
+  - platform: template
+    name: "Relay Plus Status"
+    id: relay_plus_status_sensor
+    icon: "mdi:electric-switch"
+
+  - platform: template
+    name: "Battery Heater Start"
+    id: battery_heater_start_sensor
+    icon: "mdi:radiator"
+
+  - platform: template
+    name: "Battery Heater Stop"
+    id: battery_heater_stop_sensor
+    icon: "mdi:radiator-off"
+
+  - platform: template
+    name: "Battery Heater Mail"
+    id: battery_heater_mail_sensor
+    icon: "mdi:email-alert"
+
+  - platform: template
+    name: "Battery Heater Exists"
+    id: battery_heater_exists_sensor
+    icon: "mdi:radiator"
+
+  - platform: template
+    name: "HVAC Vent Mode"
+    id: hvac_vent_mode_sensor
+    icon: "mdi:car-defrost-front"
+
+  - platform: template
+    name: "HVAC Intake Mode"
+    id: hvac_intake_mode_sensor
+    icon: "mdi:air-filter"
+
+  - platform: template
+    name: "Charge Time Condition"
+    id: charge_time_condition_sensor
+    icon: "mdi:ev-plug-chademo"
+
+  # tells which frame the "Usable SOC" value comes from
+  - platform: template
+    name: "Usable SOC Source"
+    id: usable_soc_source_sensor
+    icon: "mdi:source-branch"
+
+# ==============================================================================
+# SWITCHES (Control Modes)
+# ==============================================================================
+switch:
+  - platform: template
+    name: "Debug Polling Mode"
+    id: debug_polling_switch
+    icon: "mdi:bug-check"
+    optimistic: true
+
+# ==============================================================================
+# BUTTONS
+# ==============================================================================
+button:
+  - platform: restart
+    name: "Restart Leaf Module"
+
+  - platform: template
+    name: "Wake EV-CAN Bus"
+    id: force_can_poll_button
+    icon: "mdi:radar"
+    on_press:
+      - script.execute: request_bms_group_1
+      - delay: 300ms
+      - script.execute: request_bms_group_4
+      - delay: 300ms
+      - script.execute: request_bms_group_6
+      - delay: 300ms
+      - script.execute: request_bms_group_61
+
+# ==============================================================================
+# PASSIVE WAKE-UP / POLLING
+# ==============================================================================
+interval:
+  # REVISION 3: the LBC groups are polled in a rotation while the car is
+  # awake.  One request every 15 s, so every group is refreshed every 60 s:
+  #   1 = SOC / AHR / HX      4 = pack temperatures
+  #   6 = shunt status        61 = SOH
+  - interval: 15s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(debug_polling_switch).state ||
+                     id(is_charging) ||
+                     id(car_status_sensor).state == "ON" ||
+                     id(car_status_sensor).state == "ACC" ||
+                     id(car_status_sensor).state == "Charging/Standby";
+          then:
+            - lambda: |-
+                id(bms_retry_count) = 0;
+                switch (id(bms_group_index)) {
+                  case 0: id(request_bms_group_1).execute(); break;
+                  case 1: id(request_bms_group_4).execute(); break;
+                  case 2: id(request_bms_group_6).execute(); break;
+                  default: id(request_bms_group_61).execute(); break;
+                }
+                id(bms_group_index) = (id(bms_group_index) + 1) % 4;
+
+  # status LED : green = CAN frames are being received, red = nothing
+  - interval: 5s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return (millis() - id(last_can_frame_ms)) < 5000;
+          then:
+            - light.turn_on:
+                id: status_led
+                red: 0
+                green: 70%
+                blue: 0
+          else:
+            - light.turn_on:
+                id: status_led
+                red: 70%
+                green: 0
+                blue: 0
+
+script:
+  # ISO-TP flow control (PC = 0x30)
+  - id: bms_flow_control
+    mode: single
+    then:
+      - canbus.send:
+          can_id: 0x79B
+          use_extended_id: false
+          data: [0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+
+  # LBC group 6 : shunt status
+  # The query is the two frames documented in Leaf2018-CAN.pdf:
+  #   0x79B 02 21 06 00 00 00 00 00   (request group 6)
+  #   0x79B 30 00 00 00 00 00 00 00   (flow control)
+  # The old "send the flow control 250 ms later if nothing arrived" fallback
+  # was wrong: it polluted the bus and arrived long after the LBC had already
+  # answered (or not answered at all).
+  # REVISION 3: every request also stores the group and the time of the
+  # request, so that an incomplete answer can be repeated (see esphome on_loop).
+  - id: request_bms_group_1
+    mode: single
+    then:
+      - lambda: |-
+          id(bms_ff_seen) = false;
+          id(bms_requested_group) = 0x01;
+          id(bms_last_request_ms) = millis();
+      - canbus.send:
+          can_id: 0x79B
+          use_extended_id: false
+          data: [0x02, 0x21, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]
+      - delay: 20ms
+      - canbus.send:
+          can_id: 0x79B
+          use_extended_id: false
+          data: [0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+
+  - id: request_bms_group_4
+    mode: single
+    then:
+      - lambda: |-
+          id(bms_ff_seen) = false;
+          id(bms_requested_group) = 0x04;
+          id(bms_last_request_ms) = millis();
+      - canbus.send:
+          can_id: 0x79B
+          use_extended_id: false
+          data: [0x02, 0x21, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00]
+      - delay: 20ms
+      - canbus.send:
+          can_id: 0x79B
+          use_extended_id: false
+          data: [0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+
+  - id: request_bms_group_6
+    mode: single
+    then:
+      - lambda: |-
+          id(bms_ff_seen) = false;
+          id(bms_requested_group) = 0x06;
+          id(bms_last_request_ms) = millis();
+      - canbus.send:
+          can_id: 0x79B
+          use_extended_id: false
+          data: [0x02, 0x21, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00]
+      - delay: 20ms
+      - canbus.send:
+          can_id: 0x79B
+          use_extended_id: false
+          data: [0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+
+  # LBC group 61 : SOH
+  - id: request_bms_group_61
+    mode: single
+    then:
+      - lambda: |-
+          id(bms_ff_seen) = false;
+          id(bms_requested_group) = 0x61;
+          id(bms_last_request_ms) = millis();
+      - canbus.send:
+          can_id: 0x79B
+          use_extended_id: false
+          data: [0x02, 0x21, 0x61, 0x00, 0x00, 0x00, 0x00, 0x00]
+      - delay: 20ms
+      - canbus.send:
+          can_id: 0x79B
+          use_extended_id: false
+          data: [0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]

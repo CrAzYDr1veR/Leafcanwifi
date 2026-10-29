@@ -1,11 +1,6 @@
-# Nissan Leaf ZE1 (2018+) EV-CAN Monitor
-# Hardware: ESP32-C3 Super Mini + SN65HVD230
-# Tap: M101 gateway connector pin 12 (CANH), pin 24 (CANL)
-# DBC source: dalathegreat EV-can_ZE1.dbc
-
 esphome:
-  name: leafwifize1
-  friendly_name: Leaf CAN Monitor ZE1
+  name: leaf-can
+  friendly_name: Leaf CAN Monitor
 
 esp32:
   board: esp32-c3-devkitm-1
@@ -14,15 +9,15 @@ esp32:
     type: arduino
 
 wifi:
-  ssid: "YourSSID"
-  password: "YourPassword"
-  use_address: 192.168.1.99
+  ssid: "yourssid"
+  password: "yourpass"
+  use_address: 192.168.1.deviceip
   manual_ip:
-    static_ip: 192.168.1.99
+    static_ip: 192.168.1.deviceip
     gateway: 192.168.1.1
     subnet: 255.255.255.0
   ap:
-    ssid: "leafze1-fallback"
+    ssid: "leaf-can-fallback"
     password: "fallback123"
   power_save_mode: none
 
@@ -100,7 +95,6 @@ canbus:
     bit_rate: 500KBPS
 
     on_frame:
-      # Gear shift and car on/off status
       - can_id: 0x11A
         use_extended_id: false
         then:
@@ -119,14 +113,12 @@ canbus:
                 else id(car_status_sensor).publish_state("Unknown");
               }
 
-      # LBC SOC — 0.1% resolution
       - can_id: 0x55B
         use_extended_id: false
         then:
           - lambda: |-
               if (x.size() >= 2) {
                 uint16_t raw = ((x[0] << 8) | x[1]) >> 6;
-                if (raw == 0x3FF) return; // invalid reading
                 float soc = raw / 10.0;
                 id(lbc_soc_sensor).publish_state(soc);
 
@@ -139,10 +131,12 @@ canbus:
                     ESP_LOGI("charge", "Session started at SOC %.1f%%", soc);
                   }
 
+                  // Time to 80% and 100% using real remaining energy from 0x59E
                   float power_w = id(last_current) * id(last_voltage);
                   if (power_w > 100.0 && id(full_capacity_wh) > 0.0 && id(remaining_energy_wh) > 0.0) {
                     float wh_to_80 = (id(full_capacity_wh) * 0.8) - id(remaining_energy_wh);
                     float wh_to_100 = id(full_capacity_wh) - id(remaining_energy_wh);
+
                     if (wh_to_80 > 0) {
                       id(time_to_80_sensor).publish_state((wh_to_80 / power_w) * 60.0);
                     } else {
@@ -161,51 +155,15 @@ canbus:
                 }
               }
 
-      # Ambient temperature — ZE1 offset -40.5
       - can_id: 0x54C
         use_extended_id: false
         then:
           - lambda: |-
-              if (x.size() >= 7 && x[6] != 0xFF) {
+              if (x.size() >= 7) {
                 float temp = (x[6] * 0.5) - 40.5;
                 id(ambient_temp_sensor).publish_state(temp);
               }
 
-      # Cabin temperature from climate control unit
-      - can_id: 0x54F
-        use_extended_id: false
-        then:
-          - lambda: |-
-              if (x.size() >= 1 && x[0] != 20) {
-                float temp = (5.0 / 9.0) * (x[0] - 32);
-                id(cabin_temp_sensor).publish_state(temp);
-              }
-
-      # HVAC status and fan speed
-      - can_id: 0x54B
-        use_extended_id: false
-        then:
-          - lambda: |-
-              if (x.size() >= 5) {
-                int fan_speed = ((x[4] & 0x38) >> 3);
-                id(hvac_fan_sensor).publish_state(fan_speed / 7.0 * 100.0);
-                bool hvac_on = (x[0] == 0x10) && (fan_speed != 0);
-                id(hvac_status_sensor).publish_state(hvac_on ? "On" : "Off");
-              }
-
-      # Motor and inverter temperature
-      - can_id: 0x55A
-        use_extended_id: false
-        then:
-          - lambda: |-
-              if (x.size() >= 3) {
-                float motor_temp = (5.0 / 9.0) * (x[1] - 32);
-                float inverter_temp = (5.0 / 9.0) * (x[2] - 32);
-                id(motor_temp_sensor).publish_state(motor_temp);
-                id(inverter_temp_sensor).publish_state(inverter_temp);
-              }
-
-      # Battery current and voltage
       - can_id: 0x1DB
         use_extended_id: false
         then:
@@ -223,7 +181,6 @@ canbus:
                 id(battery_voltage_sensor).publish_state(voltage);
               }
 
-      # Charge and discharge power limits
       - can_id: 0x1DC
         use_extended_id: false
         then:
@@ -244,7 +201,6 @@ canbus:
                 }
               }
 
-      # GIDS and SOH
       - can_id: 0x5BC
         use_extended_id: false
         then:
@@ -256,16 +212,17 @@ canbus:
                 uint8_t soh = (x[4] >> 1) & 0x7F;
                 id(soh_sensor).publish_state(soh);
               }
-
-      # Full and remaining capacity from LBC
+      
       - can_id: 0x59E
         use_extended_id: false
         then:
           - lambda: |-
               if (x.size() >= 8) {
+                // LB_Full_Capacity_for_QC: bit 20, 9bit Motorola, scale 100
                 uint16_t raw_full = ((x[2] & 0x1F) << 4) | (x[3] >> 4);
                 float full_wh = raw_full * 100.0;
 
+                // LB_Remain_Capacity_for_QC: bit 27, 9bit Motorola, scale 100
                 uint16_t raw_remain = ((x[3] & 0x0F) << 5) | (x[4] >> 3);
                 float remain_wh = raw_remain * 100.0;
 
@@ -280,17 +237,6 @@ canbus:
                 }
               }
 
-      # Battery temperature from LBC
-      - can_id: 0x5C0
-        use_extended_id: false
-        then:
-          - lambda: |-
-              if (x.size() >= 3 && (x[0] >> 6) == 1) {
-                float temp = x[2] / 2.0 - 40.0;
-                id(battery_temp_sensor).publish_state(temp);
-              }
-
-      # Charge status and plug detection
       - can_id: 0x1D4
         use_extended_id: false
         then:
@@ -313,7 +259,6 @@ canbus:
                 }
               }
 
-      # Connector detection
       - can_id: 0x1F2
         use_extended_id: false
         then:
@@ -365,48 +310,6 @@ sensor:
     icon: "mdi:current-dc"
 
   - platform: template
-    name: "Battery Temperature"
-    id: battery_temp_sensor
-    unit_of_measurement: "°C"
-    accuracy_decimals: 1
-    icon: "mdi:thermometer"
-
-  - platform: template
-    name: "Motor Temperature"
-    id: motor_temp_sensor
-    unit_of_measurement: "°C"
-    accuracy_decimals: 1
-    icon: "mdi:thermometer"
-
-  - platform: template
-    name: "Inverter Temperature"
-    id: inverter_temp_sensor
-    unit_of_measurement: "°C"
-    accuracy_decimals: 1
-    icon: "mdi:thermometer"
-
-  - platform: template
-    name: "Ambient Temperature"
-    id: ambient_temp_sensor
-    unit_of_measurement: "°C"
-    accuracy_decimals: 1
-    icon: "mdi:thermometer"
-
-  - platform: template
-    name: "Cabin Temperature"
-    id: cabin_temp_sensor
-    unit_of_measurement: "°C"
-    accuracy_decimals: 1
-    icon: "mdi:thermometer"
-
-  - platform: template
-    name: "HVAC Fan Speed"
-    id: hvac_fan_sensor
-    unit_of_measurement: "%"
-    accuracy_decimals: 0
-    icon: "mdi:fan"
-
-  - platform: template
     name: "Discharge Power Limit"
     id: discharge_power_limit_sensor
     unit_of_measurement: "kW"
@@ -433,6 +336,13 @@ sensor:
     unit_of_measurement: "%"
     accuracy_decimals: 0
     icon: "mdi:heart-pulse"
+
+  - platform: template
+    name: "Ambient Temperature"
+    id: ambient_temp_sensor
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    icon: "mdi:thermometer"
 
   - platform: template
     name: "Remaining Energy"
@@ -488,11 +398,6 @@ text_sensor:
     name: "Charge Status"
     id: charge_status_sensor
     icon: "mdi:ev-station"
-
-  - platform: template
-    name: "HVAC Status"
-    id: hvac_status_sensor
-    icon: "mdi:air-conditioner"
 
 button:
   - platform: restart
